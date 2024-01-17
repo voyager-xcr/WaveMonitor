@@ -1,8 +1,9 @@
+from typing import Callable
+
 import numpy as np
 import pyqtgraph as pg
-from typing import Callable
-from PySide6.QtCore import Qt, Slot
-from PySide6.QtGui import QShortcut
+from PySide6.QtCore import QEvent, QObject, Qt, Slot
+from PySide6.QtGui import QMouseEvent, QShortcut
 from PySide6.QtWidgets import QCheckBox, QMenu, QWidgetAction
 
 
@@ -14,15 +15,10 @@ class Monitor:
         self.lines: dict[str, Line] = {}
 
         plot_widget = pg.plot(title='Wave Monitor - "F" zoom fit "C" clear all')
-        plot_widget.setContextMenuPolicy(Qt.CustomContextMenu)
-        plot_widget.customContextMenuRequested.connect(self.show_context_menu)
 
         plot_item = plot_widget.getPlotItem()
-        # plot_item.setTitle('"F" zoom fit "C" clear all')
-        # plot_item.setLabel("bottom", "t")
         plot_item.showGrid(x=True, y=True)
         plot_item.getViewBox().disableAutoRange()
-        plot_item.getViewBox().setMenuEnabled(False)  # Disable the original context menu.
 
         # Make it hold millions of points.
         plot_item.setDownsampling(auto=True, mode="subsample")
@@ -30,6 +26,12 @@ class Monitor:
         # ClipToView disables plot_item.autoRange, as well as "View all" in right-click menu.
         QShortcut("F", plot_widget).activated.connect(self.autoscale)
         QShortcut("C", plot_widget).activated.connect(self.clear)
+
+        # Replace the context menu with our own.
+        self._filter = RightClickFilter(self)
+        plot_item.getViewBox().setMenuEnabled(False)
+        # viewport gets the mouseReleaseEvent, See https://blog.csdn.net/theoryll/article/details/110918779
+        plot_widget.viewport().installEventFilter(self._filter)
 
         self.plot_widget = plot_widget
         self.plot_item = plot_item
@@ -76,7 +78,7 @@ class Monitor:
             action.setDefaultWidget(checkbox)
             context_menu.addAction(action)
 
-        context_menu.exec(self.plot_widget.mapToGlobal(pos))
+        context_menu.exec(self.plot_widget.mapToGlobal(pos.toPoint()))
 
 
 class Line:
@@ -182,16 +184,32 @@ class Line:
         return self.text.isVisible
 
 
+class RightClickFilter(QObject):
+    def __init__(self, monitor):
+        super().__init__()
+        self.monitor = monitor
+        self.mouse_press_pos = None
+
+    def eventFilter(self, watched, event: QMouseEvent):
+        if event.type() == QEvent.MouseButtonPress:
+            if event.button() == Qt.RightButton:
+                self.mouse_press_pos = event.position()
+        if event.type() == QEvent.MouseButtonRelease:
+            if event.button() == Qt.RightButton:
+                if self.mouse_press_pos is not None:
+                    if (event.position() - self.mouse_press_pos).manhattanLength() < 5:
+                        # If the mouse moved more than 10 pixels, then it's not a right-click.
+                        self.monitor.show_context_menu(event.position())
+        return super().eventFilter(watched, event)
+
+
 if __name__ == "__main__":
-    # TODO: add checkbox for filtering waves to plot. Resources:
-    # https://groups.google.com/g/pyqtgraph/c/jjUkmKaG030
-    # https://stackoverflow.com/questions/34621074/is-it-possible-to-add-a-pyqtgraph-to-a-pyside-app-without-using-a-qlayout
-    pg.mkQApp()
-    monitor = Monitor()
     t = np.linspace(0, 1, 1_00_001)  # 1m pts ~= 1ms for 1GSa/s.
     n = 20  # Okay with 20.
     i_waves = [np.cos(2 * np.pi * f * t) for f in range(1, n + 1)]
     q_waves = [np.sin(2 * np.pi * f * t) for f in range(1, n + 1)]
+    
+    monitor = Monitor()
     for i, (i_wave, q_wave) in enumerate(zip(i_waves, q_waves)):
         monitor.add_line(f"wave_{i}", t, [i_wave, q_wave])
     monitor.autoscale()
