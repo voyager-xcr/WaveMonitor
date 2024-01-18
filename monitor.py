@@ -1,63 +1,112 @@
+import sys
 from typing import Callable
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QEvent, QObject, Qt, Slot
-from PySide6.QtGui import QMouseEvent, QShortcut
-from PySide6.QtWidgets import QCheckBox, QMenu, QWidgetAction
+from PySide6.QtCore import QEvent, QObject, QPointF, Qt, Signal, Slot
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QFont,
+    QMouseEvent,
+    QPalette,
+    QShortcut,
+    QIcon,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QDockWidget,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMenu,
+)
+
+LINE_SEPERATION = 2
 
 
 class Monitor:
     """Keep a pyqtgraph plotWidget and plot waveforms on it."""
 
     def __init__(self):
-        super().__init__()
-        self.lines: dict[str, Line] = {}
+        """Construct widgets."""
+        window = QMainWindow()
+        window.setWindowTitle("Wave Monitor")
+        window.setWindowIcon(QIcon("osci3.png"))
+        # window.resize(800, 600)
 
-        plot_widget = pg.plot(title='Wave Monitor - "F" zoom fit "C" clear all')
+        plot_widget = pg.plot(parent=window)
+        window.setCentralWidget(plot_widget)
+        QShortcut("F", plot_widget).activated.connect(self.autoscale)
+        QShortcut("C", plot_widget).activated.connect(self.clear)
+        QShortcut("A", plot_widget).activated.connect(self.arrange_visible_lines)
+        QShortcut("T", plot_widget).activated.connect(self.mk_test_line)
 
         plot_item = plot_widget.getPlotItem()
         plot_item.showGrid(x=True, y=True)
-        plot_item.getViewBox().disableAutoRange()
-
         # Make it hold millions of points.
         plot_item.setDownsampling(auto=True, mode="subsample")
         plot_item.setClipToView(True)
         # ClipToView disables plot_item.autoRange, as well as "View all" in right-click menu.
-        QShortcut("F", plot_widget).activated.connect(self.autoscale)
-        QShortcut("C", plot_widget).activated.connect(self.clear)
+        plot_item.getViewBox().disableAutoRange()
 
         # Replace the context menu with our own.
-        self._filter = RightClickFilter(self)
         plot_item.getViewBox().setMenuEnabled(False)
+        _filter = RightClickFilter(self.show_context_menu)
         # viewport gets the mouseReleaseEvent, See https://blog.csdn.net/theoryll/article/details/110918779
-        plot_widget.viewport().installEventFilter(self._filter)
+        plot_widget.viewport().installEventFilter(_filter)
 
+        dock_widget = QDockWidget("visible wfms⪅30", window)
+        list_widget = QListWidget()
+        dock_widget.setWidget(list_widget)
+        dock_widget.setFloating(False)
+        dock_widget.setStyleSheet(
+            "QScrollBar:vertical {width: 10px;}" "QScrollBar:horizontal {height: 10px;}"
+        )
+        window.addDockWidget(Qt.RightDockWidgetArea, dock_widget)
+        font_metrics = dock_widget.fontMetrics()
+        initial_width = font_metrics.horizontalAdvance("X") * 15  # 15 chars wide.
+        window.resizeDocks([dock_widget], [initial_width], Qt.Horizontal)
+
+        window.show()
+
+        self.lines: dict[str, Line] = {}
+        self.window = window
         self.plot_widget = plot_widget
         self.plot_item = plot_item
-        self.line_seperation = 2
+        self.dock_widget = dock_widget
+        self.list_widget = list_widget
+        self._right_click_filter = _filter
 
-    @Slot(str, np.ndarray, list, float)
     def add_line(self, name: str, t: np.ndarray, ys: list[np.ndarray]):
         if name in self.lines:
             line = self.lines[name]
             line.update_wfm(t, ys)
         else:
-            offset = self.line_seperation * len(self.lines)
-            self.lines[name] = Line(name, t, ys, offset, self.plot_item)
+            visible_lines = self.visible_lines
+            offset = LINE_SEPERATION * len(visible_lines)
+            line = Line(name, t, ys, offset, self.plot_item, self.list_widget)
+            if len(visible_lines) >= 20:
+                line.set_visible(False)
+            self.lines[name] = line
 
-    @Slot(str)
     def remove_line(self, name: str):
         if name in self.lines:
-            self.lines[name].remove()
+            line = self.lines[name]
+            line.remove()
             del self.lines[name]
 
-    @Slot()
     def clear(self):
         for name in list(self.lines.keys()):
             self.remove_line(name)
 
-    @Slot()
+    def mk_test_line(self):
+        t = np.linspace(0, 1, 1_00_001)
+        i_wave = np.cos(2 * np.pi * 3 * t)
+        q_wave = np.sin(2 * np.pi * 3 * t)
+        self.add_line("test", t, [i_wave, q_wave])
+
     def autoscale(self):
         if self.lines:
             t0 = min(line.t0 for line in self.lines.values())
@@ -66,23 +115,42 @@ class Monitor:
             y1 = max(line.offset for line in self.lines.values()) + 1
             self.plot_item.setRange(xRange=(t0, t1), yRange=(y0, y1))
 
-    def show_context_menu(self, pos):
+    def restore_dock(self):
+        if not self.dock_widget.isVisible():
+            self.dock_widget.show()
+
+    @property
+    def visible_lines(self) -> list["Line"]:
+        return [line for line in self.lines.values() if line.is_visible()]
+
+    def arrange_visible_lines(self):
+        for i, line in enumerate(self.visible_lines):
+            line.update_offset(LINE_SEPERATION * i)
+
+    def show_context_menu(self, pos: QPointF):
         context_menu = QMenu(self.plot_widget)
 
-        for line_name, line in self.lines.items():
-            checkbox = QCheckBox(line_name)
-            checkbox.setChecked(line.is_visible())
-            checkbox.toggled.connect(line.set_visible)
+        dock_restore_action = QAction('Open "visible wfms" list', self.window)
+        dock_restore_action.triggered.connect(self.restore_dock)
+        context_menu.addAction(dock_restore_action)
 
-            action = QWidgetAction(self.plot_widget)
-            action.setDefaultWidget(checkbox)
-            context_menu.addAction(action)
+        clear_action = QAction("Clear all (C)", self.window)
+        clear_action.triggered.connect(self.clear)
+        context_menu.addAction(clear_action)
+
+        arrange_action = QAction("Arrange visible lines (A)", self.window)
+        arrange_action.triggered.connect(self.arrange_visible_lines)
+        context_menu.addAction(arrange_action)
+
+        zoom_fit_action = QAction("Zoom fit (F)", self.window)
+        zoom_fit_action.triggered.connect(self.autoscale)
+        context_menu.addAction(zoom_fit_action)
 
         context_menu.exec(self.plot_widget.mapToGlobal(pos.toPoint()))
 
 
 class Line:
-    """Container for a waveform."""
+    """Container for all assets of a line/waveform."""
 
     colors = (
         # # Simple RBG
@@ -90,16 +158,16 @@ class Line:
         # (0, 0, 255, 50),
         # (0, 255, 0, 50),
         # "dark_background" in https://matplotlib.org/stable/gallery/style_sheets/style_sheets_reference.html
-        (110, 177, 166, 50),
-        (218, 219, 146, 50),
-        (158, 154, 183, 50),
-        (214, 98, 86, 50),
-        (98, 144, 176, 50),
-        (217, 147, 69, 50),
-        (146, 188, 75, 50),
-        (155, 99, 156, 50),
-        (170, 200, 163, 50),
-        (219, 202, 81, 50),
+        (214, 98, 86, 80),
+        (98, 144, 176, 80),
+        (217, 147, 69, 80),
+        (146, 188, 75, 80),
+        (155, 99, 156, 80),
+        (170, 200, 163, 80),
+        (219, 202, 81, 80),
+        (110, 177, 166, 80),
+        (218, 219, 146, 80),
+        (158, 154, 183, 80),
     )
 
     def __init__(
@@ -109,32 +177,43 @@ class Line:
         ys: list[np.ndarray],
         offset: float,
         plot_item: pg.PlotItem,
+        list_widget: QListWidget,
     ):
-        self.plot_item = plot_item
-        self.offset = offset
-        self.t0 = t[0]
-        self.t1 = t[-1]
-        self.lines = [
+        lines = [
             plot_item.plot(
                 t, y + offset, pen=color[:-1], fillLevel=offset, fillBrush=color
             )
             for y, color in zip(ys, self.colors)
         ]
+
         text = pg.TextItem(text=name, anchor=(1, 0.5))
         plot_item.addItem(text)
-        self.text = text
         plot_item.sigXRangeChanged.connect(self.update_label_pos)
 
-    def update_wfm(self, t: np.ndarray, ys: list[np.ndarray]):
-        offset = self.offset
+        checkbox = QCheckBox(name)
+        checkbox.setChecked(True)  # Initial to visible.
+        checkbox.toggled.connect(self.set_visible)
+        list_item = QListWidgetItem(list_widget)
+        list_widget.setItemWidget(list_item, checkbox)
+
+        self.offset = offset
         self.t0 = t[0]
         self.t1 = t[-1]
+        self.plot_item = plot_item
+        self.list_widget = list_widget
+        self.lines = lines
+        self.text = text
+        self.update_label_pos()
+        self.checkbox = checkbox
+        self.list_item = list_item
+        self.list_widget = list_widget
 
+    def update_wfm(self, t: np.ndarray, ys: list[np.ndarray]):
         # Update existing lines with new data.
         old_lines = self.lines
         new_lines = []
         for line, y in zip(self.lines, ys):
-            line.setData(t, y + offset)
+            line.setData(t, y + self.offset)
             new_lines.append(line)
 
         # Remove unused lines.
@@ -146,22 +225,37 @@ class Line:
         if len(ys) > len(old_lines):
             for y, color in zip(ys[len(old_lines) :], self.colors[len(old_lines) :]):
                 line = self.plot_item.plot(
-                    t, y + offset, pen=color[:-1], fillLevel=offset, fillBrush=color
+                    t,
+                    y + self.offset,
+                    pen=color[:-1],
+                    fillLevel=self.offset,
+                    fillBrush=color,
                 )
                 new_lines.append(line)
 
+        self.t0 = t[0]
+        self.t1 = t[-1]
         self.lines = new_lines
 
     def update_offset(self, offset: float):
-        self.offset = offset
+        old_offset = self.offset
+        new_offset = offset
         for line in self.lines:
-            line.setData(y=line.yData + offset)
+            t, y = line.getData()
+            line.setData(t, y - old_offset + new_offset)
+            line.setFillLevel(new_offset)
+        self.offset = new_offset
         self.update_label_pos()
 
     def remove(self):
         for line in self.lines:
             self.plot_item.removeItem(line)
+
         self.plot_item.removeItem(self.text)
+        self.plot_item.sigXRangeChanged.disconnect(self.update_label_pos)
+
+        row = self.list_widget.row(self.list_item)
+        self.list_widget.takeItem(row)
 
     def update_label_pos(self):
         viewbox = self.plot_item.getViewBox()
@@ -175,9 +269,15 @@ class Line:
         self.text.setPos(pos, self.offset)
 
     def set_visible(self, visible: bool):
+        self.checkbox.toggled.disconnect(self.set_visible)
+
         for line in self.lines:
             line.setVisible(visible)
         self.text.setVisible(visible)
+
+        self.checkbox.setChecked(visible)
+
+        self.checkbox.toggled.connect(self.set_visible)
 
     @property
     def is_visible(self) -> Callable[[], bool]:
@@ -185,9 +285,9 @@ class Line:
 
 
 class RightClickFilter(QObject):
-    def __init__(self, monitor):
+    def __init__(self, show_ctx_menu: Callable[[QPointF], None]):
         super().__init__()
-        self.monitor = monitor
+        self.show_ctx_menu = show_ctx_menu
         self.mouse_press_pos = None
 
     def eventFilter(self, watched, event: QMouseEvent):
@@ -199,18 +299,42 @@ class RightClickFilter(QObject):
                 if self.mouse_press_pos is not None:
                     if (event.position() - self.mouse_press_pos).manhattanLength() < 5:
                         # If the mouse moved more than 10 pixels, then it's not a right-click.
-                        self.monitor.show_context_menu(event.position())
+                        self.show_ctx_menu(event.position())
         return super().eventFilter(watched, event)
+
+
+def setup_window_style(app: QApplication) -> None:
+    """Set the window style to Dark Fusion and use Segoe UI font."""
+    app.setStyle("Fusion")
+    app.setFont(QFont("Segoe UI", 10))
+
+    dark_palette = QPalette()
+    dark_palette.setColor(QPalette.Window, QColor(53, 53, 53))
+    dark_palette.setColor(QPalette.WindowText, Qt.white)
+    dark_palette.setColor(QPalette.Base, QColor(25, 25, 25))
+    dark_palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
+    dark_palette.setColor(QPalette.ToolTipBase, Qt.white)
+    dark_palette.setColor(QPalette.ToolTipText, Qt.white)
+    dark_palette.setColor(QPalette.Text, Qt.white)
+    dark_palette.setColor(QPalette.Button, QColor(53, 53, 53))
+    dark_palette.setColor(QPalette.ButtonText, Qt.white)
+    dark_palette.setColor(QPalette.BrightText, Qt.red)
+    dark_palette.setColor(QPalette.Link, QColor(42, 130, 218))
+    dark_palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
+    dark_palette.setColor(QPalette.HighlightedText, Qt.black)
+    app.setPalette(dark_palette)
 
 
 if __name__ == "__main__":
     t = np.linspace(0, 1, 1_00_001)  # 1m pts ~= 1ms for 1GSa/s.
-    n = 20  # Okay with 20.
+    n = 30  # Okay with 20.
     i_waves = [np.cos(2 * np.pi * f * t) for f in range(1, n + 1)]
     q_waves = [np.sin(2 * np.pi * f * t) for f in range(1, n + 1)]
-    
+
+    app = QApplication(sys.argv)
+    setup_window_style(app)
     monitor = Monitor()
     for i, (i_wave, q_wave) in enumerate(zip(i_waves, q_waves)):
         monitor.add_line(f"wave_{i}", t, [i_wave, q_wave])
     monitor.autoscale()
-    pg.exec()
+    sys.exit(app.exec())
