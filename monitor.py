@@ -1,6 +1,6 @@
 import logging
-import warnings
 import sys
+import warnings
 from typing import Callable
 
 import msgpack
@@ -20,7 +20,6 @@ from PySide6.QtGui import (
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QDockWidget,
     QListWidget,
     QListWidgetItem,
@@ -28,7 +27,6 @@ from PySide6.QtWidgets import (
     QMenu,
 )
 
-LINE_SEPERATION = 2
 PIPE_NAME = "wave_monitor"
 
 
@@ -36,7 +34,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG)
 
 
-class MonitorWrapper:
+class WaveMonitor:
     """Wrapper to operate Monitor in a separate process.
 
     Based on QLocalSocket (like named pipe). Messages are serialized with msgpack.
@@ -50,11 +48,17 @@ class MonitorWrapper:
         self.sock = QLocalSocket()
         self.sock.connectToServer(PIPE_NAME)
 
-    def add_line(self, name: str, t: np.ndarray, ys: list[np.ndarray]) -> None:
-        self.send_msg(dict(_type="add_line", name=name, t=t, ys=ys))
+    def add_line(
+        self, name: str, t: np.ndarray, ys: list[np.ndarray], offset: float
+    ) -> None:
+        warnings.warn("Use add_wfm instead.", DeprecationWarning)
+        self.add_wfm(name, t, ys)
 
-    def remove_line(self, name: str) -> None:
-        self.send_msg(dict(_type="remove_line", name=name))
+    def add_wfm(self, name: str, t: np.ndarray, ys: list[np.ndarray]) -> None:
+        self.send_msg(dict(_type="add_wfm", name=name, t=t, ys=ys))
+
+    def remove_wfm(self, name: str) -> None:
+        self.send_msg(dict(_type="remove_wfm", name=name))
 
     def clear(self) -> None:
         self.send_msg(dict(_type="clear"))
@@ -87,13 +91,10 @@ class MonitorWrapper:
 class DataSource(QLocalServer):
     """Receive messages from MonitorWrapper and emit signals to trigger operation on monitor."""
 
-    add_line = Signal(
-        str, np.ndarray, list
-    )  # No list[np.ndarray], this is not type annotation!
-    remove_line = Signal(str)
+    add_wfm = Signal(str, np.ndarray, list)
+    remove_wfm = Signal(str)
     clear = Signal()
     autoscale = Signal()
-    finished = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -109,10 +110,10 @@ class DataSource(QLocalServer):
         msg = msgpack.unpackb(msg, object_hook=msgpack_numpy.decode)
         logger.debug(f"Received: {msg}")
 
-        if msg["_type"] == "add_line":
-            self.add_line.emit(msg["name"], msg["t"], msg["ys"])
-        elif msg["_type"] == "remove_line":
-            self.remove_line.emit(msg["name"])
+        if msg["_type"] == "add_wfm":
+            self.add_wfm.emit(msg["name"], msg["t"], msg["ys"])
+        elif msg["_type"] == "remove_wfm":
+            self.remove_wfm.emit(msg["name"])
         elif msg["_type"] == "clear":
             self.clear.emit()
         elif msg["_type"] == "autoscale":
@@ -123,10 +124,10 @@ class DataSource(QLocalServer):
             raise ValueError(f"Unknown message type: {msg['_type']}")
 
 
-class Monitor:
+class MonitorWindow:
     """Keep some widgets and plot waveforms with them."""
 
-    def __init__(self):
+    def __init__(self, wfm_seperation: float = 2):
         """Construct widgets."""
         window = MainWindow()
         window.setWindowTitle("Wave Monitor")
@@ -134,7 +135,8 @@ class Monitor:
         QShortcut("F", window).activated.connect(self.autoscale)
         QShortcut("C", window).activated.connect(self.clear)
         QShortcut("R", window).activated.connect(self.refresh_plots)
-        QShortcut("T", window).activated.connect(self._mk_test_line)
+        QShortcut("Shift+A", window).activated.connect(self._add_test_wfm)
+        QShortcut("Shift+1", window).activated.connect(self._add_test_wfm1)
 
         plot_widget = pg.plot(parent=window)
         window.setCentralWidget(plot_widget)
@@ -168,73 +170,73 @@ class Monitor:
         window.resizeDocks([dock_widget], [initial_width], Qt.Horizontal)
 
         server = DataSource()
-        server.add_line.connect(self.add_line)
-        server.remove_line.connect(self.remove_line)
+        server.add_wfm.connect(self.add_wfm)
+        server.remove_wfm.connect(self.remove_wfm)
         server.clear.connect(self.clear)
         server.autoscale.connect(self.autoscale)
-        server.finished.connect(window.close)
         # server.removeServer(PIPE_NAME)  # Remove previous instance.
         # Interesting, read https://doc.qt.io/qtforpython-6/PySide6/QtNetwork/QLocalServer.html#PySide6.QtNetwork.PySide6.QtNetwork.QLocalServer.listen
         server.listen(PIPE_NAME)
         window.closing.connect(server.close)
 
         window.show()
-        self.lines: dict[str, "Line"] = {}
+        self.wfms: dict[str, "Waveform"] = {}
         self.window = window
         self.plot_widget = plot_widget
         self.plot_item = plot_item
         self.dock_widget = dock_widget
         self.list_widget = list_widget
         self.server = server
+        self.wfm_seperation = wfm_seperation
 
-    def add_line(self, name: str, t: np.ndarray, ys: list[np.ndarray]):
-        if name in self.lines:
-            line = self.lines[name]
-            line.update_wfm(t, ys)
+    def add_wfm(self, name: str, t: np.ndarray, ys: list[np.ndarray]):
+        if name in self.wfms:
+            wfm = self.wfms[name]
+            wfm.update_wfm(t, ys)
         else:
-            visible_lines = self.visible_lines
-            offset = LINE_SEPERATION * len(visible_lines)
-            line = Line(name, t, ys, offset, self.plot_item, self.list_widget)
-            if len(visible_lines) >= 20:
-                line.set_visible(False)
-            self.lines[name] = line
+            visible_wfms = self.visible_wfms
+            offset = self.wfm_seperation * len(visible_wfms)
+            wfm = Waveform(name, t, ys, offset, self.plot_item, self.list_widget)
+            if len(visible_wfms) >= 20:
+                wfm.set_visible(False)
+            self.wfms[name] = wfm
 
-    def remove_line(self, name: str):
-        if name in self.lines:
-            line = self.lines[name]
-            line.remove()
-            del self.lines[name]
+    def remove_wfm(self, name: str):
+        if name in self.wfms:
+            self.wfms[name].remove()
+            del self.wfms[name]
 
     def clear(self):
-        for name in list(self.lines.keys()):
-            self.remove_line(name)
+        for name in list(self.wfms.keys()):
+            self.remove_wfm(name)
 
     def autoscale(self):
-        if self.lines:
-            t0 = min(line.t0 for line in self.lines.values())
-            t1 = max(line.t1 for line in self.lines.values())
-            y0 = min(line.offset for line in self.lines.values()) - 1
-            y1 = max(line.offset for line in self.lines.values()) + 1
+        if self.wfms:
+            t0 = min(wfm.t0 for wfm in self.wfms.values())
+            t1 = max(wfm.t1 for wfm in self.wfms.values())
+            y0 = min(wfm.offset for wfm in self.wfms.values()) - 1
+            y1 = max(wfm.offset for wfm in self.wfms.values()) + 1
             self.plot_item.setRange(xRange=(t0, t1), yRange=(y0, y1))
 
     def refresh_plots(self):
-        for i, line in enumerate(self.visible_lines):
-            line.update_offset(LINE_SEPERATION * i)
+        for i, wfm in enumerate(self.visible_wfms):
+            wfm.update_offset(self.wfm_seperation * i)
 
     @property
-    def visible_lines(self) -> list["Line"]:
-        # return [line for line in self.lines.values() if line.is_visible()]
-        return [
-            self.lines[name]
-            for name in self.list_item_names
-            if self.lines[name].is_visible()
-        ]
+    def visible_wfms(self) -> list["Waveform"]:
+        """Return a list of visible wfms, sorted as in list_widget."""
+        list_wfms = []
+        for name in self.list_names:
+            wfm = self.wfms[name]
+            if wfm.is_visible():
+                list_wfms.append(wfm)
+        return list_wfms
 
     @property
-    def list_item_names(self) -> list[str]:
-        return [
-            self.list_widget.item(i).text() for i in range(self.list_widget.count())
-        ]
+    def list_names(self) -> list[str]:
+        """Return list of item names in list_widget, should be names of wfms."""
+        list_widget = self.list_widget
+        return [list_widget.item(i).text() for i in range(list_widget.count())]
 
     def restore_dock(self):
         if not self.dock_widget.isVisible():
@@ -265,15 +267,22 @@ class Monitor:
 
         context_menu.exec(self.plot_widget.mapToGlobal(pos.toPoint()))
 
-    def _mk_test_line(self):
-        t = np.linspace(0, 1, 1_00_001)
-        i_wave = np.cos(2 * np.pi * 3 * t)
-        q_wave = np.sin(2 * np.pi * 3 * t)
-        self.add_line("test", t, [i_wave, q_wave])
+    def _add_test_wfm(self):
+        i = len(self.wfms)
+        t = np.linspace(0, 1, 100_001)
+        i_wave = np.cos(2 * np.pi * i * t)
+        q_wave = np.sin(2 * np.pi * i * t)
+        self.add_wfm(f"test_wfm_{i}", t, [i_wave, q_wave])
 
+    def _add_test_wfm1(self):
+        t = np.linspace(0, 1, 10_001)
+        i_wave = np.random.rand(t.size)
+        q_wave = np.random.rand(t.size)
+        z_wave = np.random.rand(t.size)
+        self.add_wfm(f"test_wfm_random", t, [i_wave, q_wave, z_wave])
 
-class Line:
-    """Container for all assets of a line/waveform."""
+class Waveform:
+    """Container for all assets of a waveform."""
 
     colors = (
         # # Simple RBG
@@ -461,15 +470,17 @@ def setup_window_style(app: QApplication) -> None:
 
 
 if __name__ == "__main__":
-    t = np.linspace(0, 1, 1_00_001)  # 1m pts ~= 1ms for 1GSa/s.
-    n = 10
-    i_waves = [np.cos(2 * np.pi * f * t) for f in range(1, n + 1)]
-    q_waves = [np.sin(2 * np.pi * f * t) for f in range(1, n + 1)]
 
     app = QApplication(sys.argv)
     setup_window_style(app)
-    monitor = Monitor()
-    for i, (i_wave, q_wave) in enumerate(zip(i_waves, q_waves)):
-        monitor.add_line(f"wave_{i}", t, [i_wave, q_wave])
-    monitor.autoscale()
+    monitor = MonitorWindow()
+
+    # t = np.linspace(0, 1, 1_00_001)  # 1m pts ~= 1ms for 1GSa/s.
+    # n = 10
+    # i_waves = [np.cos(2 * np.pi * f * t) for f in range(1, n + 1)]
+    # q_waves = [np.sin(2 * np.pi * f * t) for f in range(1, n + 1)]
+    # for i, (i_wave, q_wave) in enumerate(zip(i_waves, q_waves)):
+    #     monitor.add_wfm(f"wave_{i}", t, [i_wave, q_wave])
+    # monitor.autoscale()
+
     sys.exit(app.exec())
