@@ -38,13 +38,14 @@ logging.basicConfig(level=logging.DEBUG)
 
 class MonitorWrapper:
     """Wrapper to operate Monitor in a separate process.
-    
+
     Based on QLocalSocket (like named pipe). Messages are serialized with msgpack.
 
     Note:
         The wrapper is not intend for Qt application, which means no event loop,
         also no signals or slots.
     """
+
     def __init__(self) -> None:
         self.sock = QLocalSocket()
         self.sock.connectToServer(PIPE_NAME)
@@ -85,7 +86,10 @@ class MonitorWrapper:
 
 class DataSource(QLocalServer):
     """Receive messages from MonitorWrapper and emit signals to trigger operation on monitor."""
-    add_line = Signal(str, np.ndarray, list)  # No list[np.ndarray], this is not type annotation!
+
+    add_line = Signal(
+        str, np.ndarray, list
+    )  # No list[np.ndarray], this is not type annotation!
     remove_line = Signal(str)
     clear = Signal()
     autoscale = Signal()
@@ -127,14 +131,13 @@ class Monitor:
         window = MainWindow()
         window.setWindowTitle("Wave Monitor")
         window.setWindowIcon(QIcon("osci3.png"))
-        # window.resize(800, 600)
+        QShortcut("F", window).activated.connect(self.autoscale)
+        QShortcut("C", window).activated.connect(self.clear)
+        QShortcut("R", window).activated.connect(self.refresh_plots)
+        QShortcut("T", window).activated.connect(self._mk_test_line)
 
         plot_widget = pg.plot(parent=window)
         window.setCentralWidget(plot_widget)
-        QShortcut("F", plot_widget).activated.connect(self.autoscale)
-        QShortcut("C", plot_widget).activated.connect(self.clear)
-        QShortcut("A", plot_widget).activated.connect(self.arrange_visible_lines)
-        QShortcut("T", plot_widget).activated.connect(self.mk_test_line)
 
         plot_item = plot_widget.getPlotItem()
         plot_item.showGrid(x=True, y=True)
@@ -144,8 +147,8 @@ class Monitor:
         # ClipToView disables plot_item.autoRange, as well as "View all" in right-click menu.
         plot_item.getViewBox().disableAutoRange()
 
-        # Replace the context menu with our own.
-        plot_item.getViewBox().setMenuEnabled(False)
+        # Custom context menu.
+        plot_item.getViewBox().setMenuEnabled(False)  # Disable the menu by pyqtgraph.
         _filter = RightClickFilter(self.show_context_menu)
         # viewport gets the mouseReleaseEvent, See https://blog.csdn.net/theoryll/article/details/110918779
         plot_widget.viewport().installEventFilter(_filter)
@@ -153,6 +156,7 @@ class Monitor:
 
         dock_widget = QDockWidget("visible wfms⪅30", window)
         list_widget = QListWidget()
+        list_widget.setDragDropMode(QListWidget.InternalMove)
         dock_widget.setWidget(list_widget)
         dock_widget.setFloating(False)
         dock_widget.setStyleSheet(
@@ -162,8 +166,6 @@ class Monitor:
         font_metrics = dock_widget.fontMetrics()
         initial_width = font_metrics.horizontalAdvance("X") * 15  # 15 chars wide.
         window.resizeDocks([dock_widget], [initial_width], Qt.Horizontal)
-
-        window.show()
 
         server = DataSource()
         server.add_line.connect(self.add_line)
@@ -176,6 +178,7 @@ class Monitor:
         server.listen(PIPE_NAME)
         window.closing.connect(server.close)
 
+        window.show()
         self.lines: dict[str, "Line"] = {}
         self.window = window
         self.plot_widget = plot_widget
@@ -206,12 +209,6 @@ class Monitor:
         for name in list(self.lines.keys()):
             self.remove_line(name)
 
-    def mk_test_line(self):
-        t = np.linspace(0, 1, 1_00_001)
-        i_wave = np.cos(2 * np.pi * 3 * t)
-        q_wave = np.sin(2 * np.pi * 3 * t)
-        self.add_line("test", t, [i_wave, q_wave])
-
     def autoscale(self):
         if self.lines:
             t0 = min(line.t0 for line in self.lines.values())
@@ -220,42 +217,59 @@ class Monitor:
             y1 = max(line.offset for line in self.lines.values()) + 1
             self.plot_item.setRange(xRange=(t0, t1), yRange=(y0, y1))
 
+    def refresh_plots(self):
+        for i, line in enumerate(self.visible_lines):
+            line.update_offset(LINE_SEPERATION * i)
+
+    @property
+    def visible_lines(self) -> list["Line"]:
+        # return [line for line in self.lines.values() if line.is_visible()]
+        return [
+            self.lines[name]
+            for name in self.list_item_names
+            if self.lines[name].is_visible()
+        ]
+
+    @property
+    def list_item_names(self) -> list[str]:
+        return [
+            self.list_widget.item(i).text() for i in range(self.list_widget.count())
+        ]
+
     def restore_dock(self):
         if not self.dock_widget.isVisible():
             self.dock_widget.show()
 
-    @property
-    def visible_lines(self) -> list["Line"]:
-        return [line for line in self.lines.values() if line.is_visible()]
-
-    def arrange_visible_lines(self):
-        for i, line in enumerate(self.visible_lines):
-            line.update_offset(LINE_SEPERATION * i)
-
     def show_context_menu(self, pos: QPointF):
         context_menu = QMenu(self.plot_widget)
 
-        dock_restore_action = QAction('Open "visible wfms" list', self.window)
-        dock_restore_action.triggered.connect(self.restore_dock)
-        context_menu.addAction(dock_restore_action)
+        zoom_fit_action = QAction("Zoom fit (F)", self.window)
+        zoom_fit_action.triggered.connect(self.autoscale)
+        context_menu.addAction(zoom_fit_action)
+
+        arrange_action = QAction("Refresh plots (R)", self.window)
+        arrange_action.triggered.connect(self.refresh_plots)
+        context_menu.addAction(arrange_action)
 
         clear_action = QAction("Clear all (C)", self.window)
         clear_action.triggered.connect(self.clear)
         context_menu.addAction(clear_action)
 
-        arrange_action = QAction("Arrange visible lines (A)", self.window)
-        arrange_action.triggered.connect(self.arrange_visible_lines)
-        context_menu.addAction(arrange_action)
-
-        zoom_fit_action = QAction("Zoom fit (F)", self.window)
-        zoom_fit_action.triggered.connect(self.autoscale)
-        context_menu.addAction(zoom_fit_action)
+        dock_restore_action = QAction('Open "visible wfms" list', self.window)
+        dock_restore_action.triggered.connect(self.restore_dock)
+        context_menu.addAction(dock_restore_action)
 
         # Not working. But anyway, it is slow.
         export_action = QAction("PyQtGraph Export (csv slow!)", self.window)
         export_action.triggered.connect(self.plot_widget.sceneObj.showExportDialog)
 
         context_menu.exec(self.plot_widget.mapToGlobal(pos.toPoint()))
+
+    def _mk_test_line(self):
+        t = np.linspace(0, 1, 1_00_001)
+        i_wave = np.cos(2 * np.pi * 3 * t)
+        q_wave = np.sin(2 * np.pi * 3 * t)
+        self.add_line("test", t, [i_wave, q_wave])
 
 
 class Line:
@@ -300,21 +314,21 @@ class Line:
         plot_item.addItem(text)
         plot_item.sigXRangeChanged.connect(self.update_label_pos)
 
-        checkbox = QCheckBox(name)
-        checkbox.setChecked(True)  # Initial to visible.
-        checkbox.toggled.connect(self.set_visible)
-        list_item = QListWidgetItem(list_widget)
-        list_widget.setItemWidget(list_item, checkbox)
+        list_item = QListWidgetItem(name)
+        list_item.setFlags(list_item.flags() | Qt.ItemIsUserCheckable)  # Add checkbox.
+        list_item.setCheckState(Qt.Checked)
+        # QListWidgetItem is not a QObject, so it can't emit signals.
+        # The checkbox state change is emitted by QListWidget.
+        list_widget.itemChanged.connect(self.handel_checkbox_change)
+        list_widget.addItem(list_item)
 
         self.offset = offset
         self.t0 = t[0]
         self.t1 = t[-1]
         self.plot_item = plot_item
-        self.list_widget = list_widget
         self.lines = lines
         self.text = text
         self.update_label_pos()
-        self.checkbox = checkbox
         self.list_item = list_item
         self.list_widget = list_widget
 
@@ -379,19 +393,22 @@ class Line:
         self.text.setPos(pos, self.offset)
 
     def set_visible(self, visible: bool):
-        self.checkbox.toggled.disconnect(self.set_visible)
-
         for line in self.lines:
             line.setVisible(visible)
         self.text.setVisible(visible)
 
-        self.checkbox.setChecked(visible)
+        # Change checkbox state without triggering handel_checkbox_change.
+        self.list_widget.itemChanged.disconnect(self.handel_checkbox_change)
+        self.list_item.setCheckState(Qt.Checked if visible else Qt.Unchecked)
+        self.list_widget.itemChanged.connect(self.handel_checkbox_change)
 
-        self.checkbox.toggled.connect(self.set_visible)
+    def handel_checkbox_change(self, item: QListWidgetItem):
+        """Triggered when the checkbox is clicked."""
+        if item is self.list_item:
+            self.set_visible(item.checkState() == Qt.Checked)
 
-    @property
-    def is_visible(self) -> Callable[[], bool]:
-        return self.text.isVisible
+    def is_visible(self) -> bool:
+        return self.text.isVisible()
 
 
 class RightClickFilter(QObject):
@@ -401,6 +418,7 @@ class RightClickFilter(QObject):
         self.mouse_press_pos = None
 
     def eventFilter(self, watched, event: QMouseEvent):
+        # Filter the right-click instead dragging.
         if event.type() == QEvent.MouseButtonPress:
             if event.button() == Qt.RightButton:
                 self.mouse_press_pos = event.position()
@@ -408,7 +426,6 @@ class RightClickFilter(QObject):
             if event.button() == Qt.RightButton:
                 if self.mouse_press_pos is not None:
                     if (event.position() - self.mouse_press_pos).manhattanLength() < 5:
-                        # If the mouse moved more than 10 pixels, then it's not a right-click.
                         self.show_ctx_menu(event.position())
         return super().eventFilter(watched, event)
 
