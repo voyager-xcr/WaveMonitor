@@ -1,6 +1,10 @@
+import logging
+import warnings
 import sys
 from typing import Callable
 
+import msgpack
+import msgpack_numpy
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QEvent, QObject, QPointF, Qt, Signal, Slot
@@ -8,11 +12,12 @@ from PySide6.QtGui import (
     QAction,
     QColor,
     QFont,
+    QIcon,
     QMouseEvent,
     QPalette,
     QShortcut,
-    QIcon,
 )
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -24,14 +29,102 @@ from PySide6.QtWidgets import (
 )
 
 LINE_SEPERATION = 2
+PIPE_NAME = "wave_monitor"
+
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG)
+
+
+class MonitorWrapper:
+    """Wrapper to operate Monitor in a separate process.
+    
+    Based on QLocalSocket (like named pipe). Messages are serialized with msgpack.
+
+    Note:
+        The wrapper is not intend for Qt application, which means no event loop,
+        also no signals or slots.
+    """
+    def __init__(self) -> None:
+        self.sock = QLocalSocket()
+        self.sock.connectToServer(PIPE_NAME)
+
+    def add_line(self, name: str, t: np.ndarray, ys: list[np.ndarray]) -> None:
+        self.send_msg(dict(_type="add_line", name=name, t=t, ys=ys))
+
+    def remove_line(self, name: str) -> None:
+        self.send_msg(dict(_type="remove_line", name=name))
+
+    def clear(self) -> None:
+        self.send_msg(dict(_type="clear"))
+
+    def autoscale(self) -> None:
+        self.send_msg(dict(_type="autoscale"))
+
+    def send_msg(self, msg: dict) -> None:
+        msg = msgpack.packb(msg, default=msgpack_numpy.encode)
+        self.sock.write(msg)
+
+    def close(self) -> None:
+        # Seems not necessary, because the server only listen to the newest connection.
+        self.sock.disconnectFromServer()
+        if self.sock.state() == QLocalServer.ConnectedState:
+            if not self.sock.waitForDisconnected():
+                warnings.warn("Could not disconnect from server")
+
+    def hello(self) -> bytes:
+        self.send_msg(dict(_type="are_you_there"))
+        if self.sock.waitForReadyRead(100):  # timeout in ms
+            msg = self.sock.readAll().data().strip()
+        else:
+            msg = None
+        if msg != b"yes":
+            raise RuntimeError("WaveViewer is not responding.")
+        return msg
+
+
+class DataSource(QLocalServer):
+    """Receive messages from MonitorWrapper and emit signals to trigger operation on monitor."""
+    add_line = Signal(str, np.ndarray, list)  # No list[np.ndarray], this is not type annotation!
+    remove_line = Signal(str)
+    clear = Signal()
+    autoscale = Signal()
+    finished = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.newConnection.connect(self.handle_new_connection)
+
+    def handle_new_connection(self):
+        # Only listening the newest client connection, igonring all previous.
+        self.client_connection = self.nextPendingConnection()
+        self.client_connection.readyRead.connect(self.read_client_and_emit)
+
+    def read_client_and_emit(self):
+        msg = self.client_connection.readAll().data().strip()
+        msg = msgpack.unpackb(msg, object_hook=msgpack_numpy.decode)
+        logger.debug(f"Received: {msg}")
+
+        if msg["_type"] == "add_line":
+            self.add_line.emit(msg["name"], msg["t"], msg["ys"])
+        elif msg["_type"] == "remove_line":
+            self.remove_line.emit(msg["name"])
+        elif msg["_type"] == "clear":
+            self.clear.emit()
+        elif msg["_type"] == "autoscale":
+            self.autoscale.emit()
+        elif msg["_type"] == "are_you_there":
+            self.client_connection.write(b"yes")
+        else:
+            raise ValueError(f"Unknown message type: {msg['_type']}")
 
 
 class Monitor:
-    """Keep a pyqtgraph plotWidget and plot waveforms on it."""
+    """Keep some widgets and plot waveforms with them."""
 
     def __init__(self):
         """Construct widgets."""
-        window = QMainWindow()
+        window = MainWindow()
         window.setWindowTitle("Wave Monitor")
         window.setWindowIcon(QIcon("osci3.png"))
         # window.resize(800, 600)
@@ -56,6 +149,7 @@ class Monitor:
         _filter = RightClickFilter(self.show_context_menu)
         # viewport gets the mouseReleaseEvent, See https://blog.csdn.net/theoryll/article/details/110918779
         plot_widget.viewport().installEventFilter(_filter)
+        self._right_click_filter = _filter
 
         dock_widget = QDockWidget("visible wfms⪅30", window)
         list_widget = QListWidget()
@@ -71,13 +165,24 @@ class Monitor:
 
         window.show()
 
-        self.lines: dict[str, Line] = {}
+        server = DataSource()
+        server.add_line.connect(self.add_line)
+        server.remove_line.connect(self.remove_line)
+        server.clear.connect(self.clear)
+        server.autoscale.connect(self.autoscale)
+        server.finished.connect(window.close)
+        # server.removeServer(PIPE_NAME)  # Remove previous instance.
+        # Interesting, read https://doc.qt.io/qtforpython-6/PySide6/QtNetwork/QLocalServer.html#PySide6.QtNetwork.PySide6.QtNetwork.QLocalServer.listen
+        server.listen(PIPE_NAME)
+        window.closing.connect(server.close)
+
+        self.lines: dict[str, "Line"] = {}
         self.window = window
         self.plot_widget = plot_widget
         self.plot_item = plot_item
         self.dock_widget = dock_widget
         self.list_widget = list_widget
-        self._right_click_filter = _filter
+        self.server = server
 
     def add_line(self, name: str, t: np.ndarray, ys: list[np.ndarray]):
         if name in self.lines:
@@ -146,6 +251,10 @@ class Monitor:
         zoom_fit_action.triggered.connect(self.autoscale)
         context_menu.addAction(zoom_fit_action)
 
+        # Not working. But anyway, it is slow.
+        export_action = QAction("PyQtGraph Export (csv slow!)", self.window)
+        export_action.triggered.connect(self.plot_widget.sceneObj.showExportDialog)
+
         context_menu.exec(self.plot_widget.mapToGlobal(pos.toPoint()))
 
 
@@ -179,7 +288,8 @@ class Line:
         plot_item: pg.PlotItem,
         list_widget: QListWidget,
     ):
-        lines = [
+        """Add line plot to plot_item, add checkbox to list_widget."""
+        lines: list[pg.PlotDataItem] = [
             plot_item.plot(
                 t, y + offset, pen=color[:-1], fillLevel=offset, fillBrush=color
             )
@@ -303,6 +413,14 @@ class RightClickFilter(QObject):
         return super().eventFilter(watched, event)
 
 
+class MainWindow(QMainWindow):
+    closing = Signal()
+
+    def closeEvent(self, event):
+        self.closing.emit()
+        return super().closeEvent(event)
+
+
 def setup_window_style(app: QApplication) -> None:
     """Set the window style to Dark Fusion and use Segoe UI font."""
     app.setStyle("Fusion")
@@ -327,7 +445,7 @@ def setup_window_style(app: QApplication) -> None:
 
 if __name__ == "__main__":
     t = np.linspace(0, 1, 1_00_001)  # 1m pts ~= 1ms for 1GSa/s.
-    n = 30  # Okay with 20.
+    n = 10
     i_waves = [np.cos(2 * np.pi * f * t) for f in range(1, n + 1)]
     q_waves = [np.sin(2 * np.pi * f * t) for f in range(1, n + 1)]
 
