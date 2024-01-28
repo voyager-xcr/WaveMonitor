@@ -1,7 +1,16 @@
+"""A simple waveform monitor.
+
+Usage:
+    monitor = WaveMonitor()
+    monitor.start_monitor_window()
+"""
+
 import logging
 import sys
 import warnings
-from typing import Callable
+import subprocess
+import time
+from typing import Callable, Literal, Any
 
 import msgpack
 import msgpack_numpy
@@ -25,17 +34,27 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMenu,
+    QMessageBox,
 )
 
 PIPE_NAME = "wave_monitor"
-
-
+__version__ = "0.1.0"
+about_message = (
+    f"<b>Wave Monitor</b> v{__version__}<br><br>"
+    "A simple waveform monitor for debugging.<br><br>"
+    "by Jiawei Qiu"
+)
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.DEBUG)
 
 
 class WaveMonitor:
     """Wrapper to operate Monitor in a separate process.
+
+    Before using it, start a new monitor window by either of following methods:
+
+    1. Call monitor.start_monitor_window(). This creates a new process for app event loop.
+
+    2. Run this script, which blocks the process for app event loop.
 
     Based on QLocalSocket (like named pipe). Messages are serialized with msgpack.
 
@@ -55,37 +74,82 @@ class WaveMonitor:
         self.add_wfm(name, t, ys)
 
     def add_wfm(self, name: str, t: np.ndarray, ys: list[np.ndarray]) -> None:
-        self.send_msg(dict(_type="add_wfm", name=name, t=t, ys=ys))
+        self.write(dict(_type="add_wfm", name=name, t=t, ys=ys))
 
     def remove_wfm(self, name: str) -> None:
-        self.send_msg(dict(_type="remove_wfm", name=name))
+        self.write(dict(_type="remove_wfm", name=name))
 
     def clear(self) -> None:
-        self.send_msg(dict(_type="clear"))
+        self.write(dict(_type="clear"))
 
     def autoscale(self) -> None:
-        self.send_msg(dict(_type="autoscale"))
+        self.write(dict(_type="autoscale"))
 
-    def send_msg(self, msg: dict) -> None:
+    def write(self, msg: dict) -> None:
+        if self.sock.state() != QLocalSocket.ConnectedState:
+            raise RuntimeError("WaveViewer is not running.")
+
         msg = msgpack.packb(msg, default=msgpack_numpy.encode)
         self.sock.write(msg)
 
-    def close(self) -> None:
-        # Seems not necessary, because the server only listen to the newest connection.
-        self.sock.disconnectFromServer()
-        if self.sock.state() == QLocalServer.ConnectedState:
-            if not self.sock.waitForDisconnected():
-                warnings.warn("Could not disconnect from server")
-
-    def hello(self) -> bytes:
-        self.send_msg(dict(_type="are_you_there"))
-        if self.sock.waitForReadyRead(100):  # timeout in ms
-            msg = self.sock.readAll().data().strip()
+    def query(self, msg: dict, timeout_ms: int = 100) -> bytes:
+        self.write(msg)
+        if self.sock.waitForReadyRead(timeout_ms):
+            msg = self.sock.readAll().data().strip()  # Could be empty.
         else:
-            msg = None
-        if msg != b"yes":
-            raise RuntimeError("WaveViewer is not responding.")
+            msg = b""
         return msg
+
+    def query_and_decode(self, msg: dict, timeout_ms: int = 100) -> Any:
+        reply = self.query(msg, timeout_ms)
+        if reply:
+            return msgpack.unpackb(reply, object_hook=msgpack_numpy.decode)
+        else:
+            return None
+
+    def disconnect(self) -> None:
+        self.sock.disconnectFromServer()
+        if self.sock.state() == QLocalSocket.ConnectedState:
+            if not self.sock.waitForDisconnected():
+                raise RuntimeError("Could not disconnect from server")
+
+    def connect(self, timeout_ms: int = 100) -> bool:
+        """Connect to server and returns success status."""
+        self.disconnect()  # Refresh the state, otherwise the state is still connected.
+        self.sock.connectToServer(PIPE_NAME)
+        result = self.sock.waitForConnected(timeout_ms)
+        return result
+
+    def start_monitor_window(
+        self,
+        log_level: Literal["WARNING", "INFO", "DEBUG"] = "INFO",
+        aviod_multiple: bool = True,
+        timeout_s: float = 10,
+    ) -> None:
+        """Start a monitor window in a new process. Blocks until server is listening."""
+        cmd = ["cmd", "/c", "start", sys.executable, __file__, f"--log={log_level}"]
+
+        if not self.connect(timeout_ms=100):
+            subprocess.run(cmd)
+        elif aviod_multiple:
+            logger.info("Monitor is already running, not starting a new one.")
+            return None
+        else:
+            subprocess.run(cmd)
+            warnings.warn("Monitor is already running, starting a duplicate one.")
+
+        start_time = time.time()
+        while not self.connect(timeout_ms=100):
+            if time.time() - start_time > timeout_s:
+                raise RuntimeError("Timeout waiting for server to start listening.")
+            time.sleep(0.1)
+
+    def echo(self) -> bytes:
+        """Check if the server is responding, for testing purpose."""
+        reply = self.query(dict(_type="are_you_there"))
+        if reply != b"yes":
+            raise RuntimeError("Server is not responding.")
+        return reply
 
 
 class DataSource(QLocalServer):
@@ -96,14 +160,21 @@ class DataSource(QLocalServer):
     clear = Signal()
     autoscale = Signal()
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, parent):
+        super().__init__(parent=parent)
         self.newConnection.connect(self.handle_new_connection)
+        QApplication.instance().aboutToQuit.connect(self.close)
+        # Remove previous instance. see https://doc.qt.io/qtforpython-6/PySide6/QtNetwork/QLocalServer.html#PySide6.QtNetwork.PySide6.QtNetwork.QLocalServer.removeServer
+        # self.removeServer(PIPE_NAME)  # Remove previous instance.
+        self.listen(PIPE_NAME)
+        logger.info('Listening on "%s".', PIPE_NAME)
 
-    def handle_new_connection(self):
-        # Only listening the newest client connection, igonring all previous.
+    def handle_new_connection(self):        
+        self.close_client_connection()
         self.client_connection = self.nextPendingConnection()
         self.client_connection.readyRead.connect(self.read_client_and_emit)
+        self.client_connection.disconnected.connect(lambda : logger.info('Client disconnected.') )
+        logger.info('DataSource got new connection.')
 
     def read_client_and_emit(self):
         msg = self.client_connection.readAll().data().strip()
@@ -123,18 +194,30 @@ class DataSource(QLocalServer):
         else:
             raise ValueError(f"Unknown message type: {msg['_type']}")
 
+    def close_client_connection(self):
+        if hasattr(self, "client_connection"):
+            self.client_connection.readyRead.disconnect(self.read_client_and_emit)
+            self.client_connection.close()  # Not working, because client not in qt event loop.
+
+    def close(self):
+        self.close_client_connection()
+        logger.info('Closing server "%s".', PIPE_NAME)
+        super().close()
+
 
 class MonitorWindow:
     """Keep some widgets and plot waveforms with them."""
 
     def __init__(self, wfm_seperation: float = 2):
         """Construct widgets."""
-        window = MainWindow()
+        MonitorWindow.setup_app_style(QApplication.instance())
+        window = QMainWindow()
         window.setWindowTitle("Wave Monitor")
         window.setWindowIcon(QIcon("osci3.png"))
         QShortcut("F", window).activated.connect(self.autoscale)
-        QShortcut("C", window).activated.connect(self.clear)
+        QShortcut("C", window).activated.connect(self.confirm_clear)
         QShortcut("R", window).activated.connect(self.refresh_plots)
+        QShortcut("H", window).activated.connect(self.hide_all)
         QShortcut("Shift+A", window).activated.connect(self._add_test_wfm)
         QShortcut("Shift+1", window).activated.connect(self._add_test_wfm1)
 
@@ -156,7 +239,7 @@ class MonitorWindow:
         plot_widget.viewport().installEventFilter(_filter)
         self._right_click_filter = _filter
 
-        dock_widget = QDockWidget("visible wfms⪅30", window)
+        dock_widget = QDockWidget("wfms⪅30", window)
         list_widget = QListWidget()
         list_widget.setDragDropMode(QListWidget.InternalMove)
         dock_widget.setWidget(list_widget)
@@ -169,17 +252,14 @@ class MonitorWindow:
         initial_width = font_metrics.horizontalAdvance("X") * 15  # 15 chars wide.
         window.resizeDocks([dock_widget], [initial_width], Qt.Horizontal)
 
-        server = DataSource()
+        server = DataSource(window)
         server.add_wfm.connect(self.add_wfm)
         server.remove_wfm.connect(self.remove_wfm)
         server.clear.connect(self.clear)
         server.autoscale.connect(self.autoscale)
-        # server.removeServer(PIPE_NAME)  # Remove previous instance.
-        # Interesting, read https://doc.qt.io/qtforpython-6/PySide6/QtNetwork/QLocalServer.html#PySide6.QtNetwork.PySide6.QtNetwork.QLocalServer.listen
-        server.listen(PIPE_NAME)
-        window.closing.connect(server.close)
 
         window.show()
+        logger.info("Monitor window initialized. Right-click to show context menu.")
         self.wfms: dict[str, "Waveform"] = {}
         self.window = window
         self.plot_widget = plot_widget
@@ -201,14 +281,32 @@ class MonitorWindow:
                 wfm.set_visible(False)
             self.wfms[name] = wfm
 
+    def hide_all(self):
+        for wfm in self.wfms.values():
+            wfm.set_visible(False)
+
     def remove_wfm(self, name: str):
         if name in self.wfms:
             self.wfms[name].remove()
             del self.wfms[name]
+        else:
+            logger.debug(f"Waveform {name} not found, nothing removed.")
 
     def clear(self):
         for name in list(self.wfms.keys()):
             self.remove_wfm(name)
+
+    def confirm_clear(self):
+        """Ask user to confirm before clearing all wfms."""
+        reply = QMessageBox.question(
+            self.window,
+            "Clear all waveforms?",
+            "Are you sure to clear all waveforms?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self.clear()
 
     def autoscale(self):
         if self.wfms:
@@ -249,23 +347,62 @@ class MonitorWindow:
         zoom_fit_action.triggered.connect(self.autoscale)
         context_menu.addAction(zoom_fit_action)
 
-        arrange_action = QAction("Refresh plots (R)", self.window)
-        arrange_action.triggered.connect(self.refresh_plots)
-        context_menu.addAction(arrange_action)
+        refresh_action = QAction("Refresh plots (R)", self.window)
+        refresh_action.triggered.connect(self.refresh_plots)
+        context_menu.addAction(refresh_action)
+
+        hide_all_action = QAction("Hide all (H)", self.window)
+        hide_all_action.triggered.connect(self.hide_all)
+        context_menu.addAction(hide_all_action)
 
         clear_action = QAction("Clear all (C)", self.window)
-        clear_action.triggered.connect(self.clear)
+        clear_action.triggered.connect(self.confirm_clear)
         context_menu.addAction(clear_action)
 
-        dock_restore_action = QAction('Open "visible wfms" list', self.window)
+        sort_action = QAction('Sort "wfms" list', self.window)
+        sort_action.triggered.connect(self.list_widget.sortItems)
+        context_menu.addAction(sort_action)
+
+        dock_restore_action = QAction('Restore "wfms" list', self.window)
         dock_restore_action.triggered.connect(self.restore_dock)
         context_menu.addAction(dock_restore_action)
 
-        # Not working. But anyway, it is slow.
-        export_action = QAction("PyQtGraph Export (csv slow!)", self.window)
-        export_action.triggered.connect(self.plot_widget.sceneObj.showExportDialog)
+        # # Not working. But anyway, it is slow.
+        # export_action = QAction("PyQtGraph Export (csv slow!)", self.window)
+        # export_action.triggered.connect(self.plot_widget.sceneObj.showExportDialog)
+
+        context_menu.addSeparator()
+
+        about_action = QAction("About", self.window)
+        about_action.triggered.connect(self.show_about_dialog)
+        context_menu.addAction(about_action)
 
         context_menu.exec(self.plot_widget.mapToGlobal(pos.toPoint()))
+
+    def show_about_dialog(self):
+        QMessageBox.about(self.window, "About Wave Monitor", about_message)
+
+    @staticmethod
+    def setup_app_style(app: QApplication) -> None:
+        """Set the window style to Dark Fusion and use Segoe UI font."""
+        app.setStyle("Fusion")
+        app.setFont(QFont("Segoe UI", 10))
+
+        dark_palette = QPalette()
+        dark_palette.setColor(QPalette.Window, QColor(53, 53, 53))
+        dark_palette.setColor(QPalette.WindowText, Qt.white)
+        dark_palette.setColor(QPalette.Base, QColor(25, 25, 25))
+        dark_palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
+        dark_palette.setColor(QPalette.ToolTipBase, Qt.white)
+        dark_palette.setColor(QPalette.ToolTipText, Qt.white)
+        dark_palette.setColor(QPalette.Text, Qt.white)
+        dark_palette.setColor(QPalette.Button, QColor(53, 53, 53))
+        dark_palette.setColor(QPalette.ButtonText, Qt.white)
+        dark_palette.setColor(QPalette.BrightText, Qt.red)
+        dark_palette.setColor(QPalette.Link, QColor(42, 130, 218))
+        dark_palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
+        dark_palette.setColor(QPalette.HighlightedText, Qt.black)
+        app.setPalette(dark_palette)
 
     def _add_test_wfm(self):
         i = len(self.wfms)
@@ -276,10 +413,12 @@ class MonitorWindow:
 
     def _add_test_wfm1(self):
         t = np.linspace(0, 1, 10_001)
-        i_wave = np.random.rand(t.size)
-        q_wave = np.random.rand(t.size)
+        f = np.random.randint(3, 100)
+        i_wave = np.cos(2 * np.pi * f * t)
+        q_wave = np.sin(2 * np.pi * f * t)
         z_wave = np.random.rand(t.size)
         self.add_wfm(f"test_wfm_random", t, [i_wave, q_wave, z_wave])
+
 
 class Waveform:
     """Container for all assets of a waveform."""
@@ -439,48 +578,24 @@ class RightClickFilter(QObject):
         return super().eventFilter(watched, event)
 
 
-class MainWindow(QMainWindow):
-    closing = Signal()
-
-    def closeEvent(self, event):
-        self.closing.emit()
-        return super().closeEvent(event)
-
-
-def setup_window_style(app: QApplication) -> None:
-    """Set the window style to Dark Fusion and use Segoe UI font."""
-    app.setStyle("Fusion")
-    app.setFont(QFont("Segoe UI", 10))
-
-    dark_palette = QPalette()
-    dark_palette.setColor(QPalette.Window, QColor(53, 53, 53))
-    dark_palette.setColor(QPalette.WindowText, Qt.white)
-    dark_palette.setColor(QPalette.Base, QColor(25, 25, 25))
-    dark_palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
-    dark_palette.setColor(QPalette.ToolTipBase, Qt.white)
-    dark_palette.setColor(QPalette.ToolTipText, Qt.white)
-    dark_palette.setColor(QPalette.Text, Qt.white)
-    dark_palette.setColor(QPalette.Button, QColor(53, 53, 53))
-    dark_palette.setColor(QPalette.ButtonText, Qt.white)
-    dark_palette.setColor(QPalette.BrightText, Qt.red)
-    dark_palette.setColor(QPalette.Link, QColor(42, 130, 218))
-    dark_palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
-    dark_palette.setColor(QPalette.HighlightedText, Qt.black)
-    app.setPalette(dark_palette)
+def config_log(dafault_loglevel="INFO"):
+    # Get the log level from command line arguments, find pattern like "=-log=DEBUG"
+    loglevel = next(
+        (arg.split("=")[1] for arg in sys.argv if arg.startswith("--log=")),
+        dafault_loglevel,
+    )
+    numeric_level = getattr(logging, loglevel.upper(), None)
+    if not isinstance(numeric_level, int):
+        raise ValueError("Invalid log level: %s" % loglevel)
+    logging.basicConfig(
+        level=numeric_level,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
 
 if __name__ == "__main__":
-
+    config_log()
     app = QApplication(sys.argv)
-    setup_window_style(app)
     monitor = MonitorWindow()
-
-    # t = np.linspace(0, 1, 1_00_001)  # 1m pts ~= 1ms for 1GSa/s.
-    # n = 10
-    # i_waves = [np.cos(2 * np.pi * f * t) for f in range(1, n + 1)]
-    # q_waves = [np.sin(2 * np.pi * f * t) for f in range(1, n + 1)]
-    # for i, (i_wave, q_wave) in enumerate(zip(i_waves, q_waves)):
-    #     monitor.add_wfm(f"wave_{i}", t, [i_wave, q_wave])
-    # monitor.autoscale()
-
     sys.exit(app.exec())
