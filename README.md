@@ -15,7 +15,7 @@ pip install wave-monitor
 or install from source.
 
 ```bash
-pip install git+https://github.com/Qiujv/LabCodes.git
+pip install git+https://github.com/Qiujv/WaveMonitor.git
 ```
 
 # Usage

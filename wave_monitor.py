@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import warnings
+from pathlib import Path
 from typing import Any, Callable, Literal
 
 import msgpack
@@ -286,7 +287,7 @@ class MonitorWindow:
         MonitorWindow.setup_app_style(QApplication.instance())
         window = QMainWindow()
         window.setWindowTitle("Wave Monitor")
-        window.setWindowIcon(QIcon("icon.png"))
+        window.setWindowIcon(QIcon(Path(__file__).parent / "icon.png"))
         QShortcut("F", window).activated.connect(self.autoscale)
         QShortcut("C", window).activated.connect(self.confirm_clear)
         QShortcut("R", window).activated.connect(self.refresh_plots)
