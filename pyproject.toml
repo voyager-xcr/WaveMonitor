@@ -1,0 +1,25 @@
+[project]
+name = "WaveMonitor"
+version = "0.0.1"
+dependencies = [
+    "msgpack",
+    "msgpack_numpy",
+    "numpy",
+    "pyqtgraph",
+    "PySide6",
+]
+# requires-python = ">=3.8"
+authors = [{ name = "Qiujv", email = "qiujv@outlook.com" }]
+description = "A simple GUI for monitoring waveforms."
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+]
+
+[project.urls]
+Homepage = "https://github.com/Qiujv/WaveMonitor"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
