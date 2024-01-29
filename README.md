@@ -26,7 +26,7 @@ from wave_monitor import WaveMonitor
 import numpy as np
 
 monitor = WaveMonitor()
-monitor.find_or_run_monitor_window("DEBUG")
+monitor.find_or_run_monitor_window()
 monitor.autoscale()
 # monitor.clear()
 
@@ -40,7 +40,6 @@ for i, (i_wave, q_wave) in enumerate(zip(i_waves, q_waves)):
 monitor.autoscale()
 
 monitor.remove_wfm("wave_10")
-monitor.echo()
 
 ```
 

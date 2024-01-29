@@ -286,7 +286,7 @@ class MonitorWindow:
         MonitorWindow.setup_app_style(QApplication.instance())
         window = QMainWindow()
         window.setWindowTitle("Wave Monitor")
-        window.setWindowIcon(QIcon("osci3.png"))
+        window.setWindowIcon(QIcon("icon.png"))
         QShortcut("F", window).activated.connect(self.autoscale)
         QShortcut("C", window).activated.connect(self.confirm_clear)
         QShortcut("R", window).activated.connect(self.refresh_plots)
