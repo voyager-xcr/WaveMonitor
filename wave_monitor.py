@@ -2,15 +2,15 @@
 
 Usage:
     monitor = WaveMonitor()
-    monitor.start_monitor_window()
+    monitor.run_monitor_window()
 """
 
 import logging
-import sys
-import warnings
 import subprocess
+import sys
 import time
-from typing import Callable, Literal, Any
+import warnings
+from typing import Any, Callable, Literal
 
 import msgpack
 import msgpack_numpy
@@ -41,7 +41,7 @@ PIPE_NAME = "wave_monitor"
 __version__ = "0.1.0"
 about_message = (
     f"<b>Wave Monitor</b> v{__version__}<br><br>"
-    "A simple waveform monitor for debugging.<br><br>"
+    "A simple waveform monitor.<br><br>"
     "by Jiawei Qiu"
 )
 logger = logging.getLogger(__name__)
@@ -52,7 +52,7 @@ class WaveMonitor:
 
     Before using it, start a new monitor window by either of following methods:
 
-    1. Call monitor.start_monitor_window(). This creates a new process for app event loop.
+    1. Call monitor.run_monitor_window(). This creates a new process for app event loop.
 
     2. Run this script, which blocks the process for app event loop.
 
@@ -62,6 +62,8 @@ class WaveMonitor:
         The wrapper is not intend for Qt application, which means no event loop,
         also no signals or slots.
     """
+
+    logger = logger.getChild("WaveMonitor")
 
     def __init__(self) -> None:
         self.sock = QLocalSocket()
@@ -87,13 +89,17 @@ class WaveMonitor:
 
     def write(self, msg: dict) -> None:
         if self.sock.state() != QLocalSocket.ConnectedState:
-            raise RuntimeError("WaveViewer is not running.")
+            raise RuntimeError("Socket not connected")
 
         msg = msgpack.packb(msg, default=msgpack_numpy.encode)
-        self.sock.write(msg)
+        msg = msg + b"\n"  # Add a newline to indicate the end of message.
+        self.sock.write(msgpack.packb(len(msg)) + b"\n")
+        self.sock.waitForBytesWritten()
+        self.sock.write(msg)  # Send the message
 
     def query(self, msg: dict, timeout_ms: int = 100) -> bytes:
         self.write(msg)
+        self.sock.waitForBytesWritten()  # Make sure bytes written.
         if self.sock.waitForReadyRead(timeout_ms):
             msg = self.sock.readAll().data().strip()  # Could be empty.
         else:
@@ -113,33 +119,36 @@ class WaveMonitor:
             if not self.sock.waitForDisconnected():
                 raise RuntimeError("Could not disconnect from server")
 
-    def connect(self, timeout_ms: int = 100) -> bool:
+    def confirm_connect(self, timeout_ms: int = 100) -> bool:
         """Connect to server and returns success status."""
         self.disconnect()  # Refresh the state, otherwise the state is still connected.
         self.sock.connectToServer(PIPE_NAME)
         result = self.sock.waitForConnected(timeout_ms)
         return result
 
-    def start_monitor_window(
+    def run_monitor_window(
         self,
         log_level: Literal["WARNING", "INFO", "DEBUG"] = "INFO",
         aviod_multiple: bool = True,
         timeout_s: float = 10,
     ) -> None:
-        """Start a monitor window in a new process. Blocks until server is listening."""
+        """Connect to existing monitor_window or create one in new process.
+
+        Blocks until server is listening.
+        """
         cmd = ["cmd", "/c", "start", sys.executable, __file__, f"--log={log_level}"]
 
-        if not self.connect(timeout_ms=100):
+        if not self.confirm_connect(timeout_ms=100):
             subprocess.run(cmd)
         elif aviod_multiple:
-            logger.info("Monitor is already running, not starting a new one.")
+            self.logger.info("Monitor is already running, not starting a new one.")
             return None
         else:
             subprocess.run(cmd)
             warnings.warn("Monitor is already running, starting a duplicate one.")
 
         start_time = time.time()
-        while not self.connect(timeout_ms=100):
+        while not self.confirm_connect(timeout_ms=100):
             if time.time() - start_time > timeout_s:
                 raise RuntimeError("Timeout waiting for server to start listening.")
             time.sleep(0.1)
@@ -159,28 +168,65 @@ class DataSource(QLocalServer):
     remove_wfm = Signal(str)
     clear = Signal()
     autoscale = Signal()
+    logger = logger.getChild("DataSource")
 
     def __init__(self, parent):
         super().__init__(parent=parent)
+        self.partial_msg: bytes = b""
+        self.expected_msg_length: int = None
+
         self.newConnection.connect(self.handle_new_connection)
         QApplication.instance().aboutToQuit.connect(self.close)
         # Remove previous instance. see https://doc.qt.io/qtforpython-6/PySide6/QtNetwork/QLocalServer.html#PySide6.QtNetwork.PySide6.QtNetwork.QLocalServer.removeServer
         # self.removeServer(PIPE_NAME)  # Remove previous instance.
         self.listen(PIPE_NAME)
-        logger.info('Listening on "%s".', PIPE_NAME)
+        self.logger.info('Listening on "%s".', PIPE_NAME)
 
-    def handle_new_connection(self):        
+    def handle_new_connection(self):
         self.close_client_connection()
         self.client_connection = self.nextPendingConnection()
         self.client_connection.readyRead.connect(self.read_client_and_emit)
-        self.client_connection.disconnected.connect(lambda : logger.info('Client disconnected.') )
-        logger.info('DataSource got new connection.')
+        self.client_connection.disconnected.connect(
+            lambda: self.logger.info("Client disconnected.")
+        )
+        self.logger.info("New client connected.")
 
     def read_client_and_emit(self):
-        msg = self.client_connection.readAll().data().strip()
-        msg = msgpack.unpackb(msg, object_hook=msgpack_numpy.decode)
-        logger.debug(f"Received: {msg}")
+        # One readyRead signal may contain multiple messages.
+        while self.client_connection.canReadLine():
+            # Read the msg length.
+            if self.expected_msg_length is None:
+                line = self.client_connection.readLine().data().strip()
+                self.expected_msg_length = msgpack.unpackb(
+                    line, object_hook=msgpack_numpy.decode
+                )
+                logger.debug(f"Expecting {self.expected_msg_length} bytes for msg.")
+                continue
 
+            # Read the msg.
+            line = self.client_connection.readLine().data()
+            self.partial_msg += line
+
+            if len(self.partial_msg) < self.expected_msg_length:
+                self.logger.debug(
+                    "msg len: %s, expected: %s",
+                    len(self.partial_msg),
+                    self.expected_msg_length,
+                )
+                time.sleep(0.1)
+                continue
+
+            # Process the message
+            msg = msgpack.unpackb(
+                self.partial_msg.strip(), object_hook=msgpack_numpy.decode
+            )
+            self.partial_msg = b""
+            self.expected_msg_length = None
+
+            self.logger.debug(f"Received: {msg}")
+            self.emit_signals(msg)
+
+    def emit_signals(self, msg: dict):
         if msg["_type"] == "add_wfm":
             self.add_wfm.emit(msg["name"], msg["t"], msg["ys"])
         elif msg["_type"] == "remove_wfm":
@@ -201,12 +247,14 @@ class DataSource(QLocalServer):
 
     def close(self):
         self.close_client_connection()
-        logger.info('Closing server "%s".', PIPE_NAME)
+        self.logger.info('Closing server "%s".', PIPE_NAME)
         super().close()
 
 
 class MonitorWindow:
     """Keep some widgets and plot waveforms with them."""
+
+    logger = logger.getChild("MonitorWindow")
 
     def __init__(self, wfm_seperation: float = 2):
         """Construct widgets."""
@@ -242,6 +290,9 @@ class MonitorWindow:
         dock_widget = QDockWidget("wfms⪅30", window)
         list_widget = QListWidget()
         list_widget.setDragDropMode(QListWidget.InternalMove)
+        _filter = DeleteEventFilter(self.remove_wfm, list_widget)
+        list_widget.installEventFilter(_filter)
+        self._delete_event_filter = _filter
         dock_widget.setWidget(list_widget)
         dock_widget.setFloating(False)
         dock_widget.setStyleSheet(
@@ -259,7 +310,7 @@ class MonitorWindow:
         server.autoscale.connect(self.autoscale)
 
         window.show()
-        logger.info("Monitor window initialized. Right-click to show context menu.")
+        self.logger.info("Ready. Right-click to show menu.")
         self.wfms: dict[str, "Waveform"] = {}
         self.window = window
         self.plot_widget = plot_widget
@@ -290,7 +341,7 @@ class MonitorWindow:
             self.wfms[name].remove()
             del self.wfms[name]
         else:
-            logger.debug(f"Waveform {name} not found, nothing removed.")
+            self.logger.debug(f"Waveform {name} not found, nothing removed.")
 
     def clear(self):
         for name in list(self.wfms.keys()):
@@ -576,6 +627,25 @@ class RightClickFilter(QObject):
                     if (event.position() - self.mouse_press_pos).manhattanLength() < 5:
                         self.show_ctx_menu(event.position())
         return super().eventFilter(watched, event)
+
+
+class DeleteEventFilter(QObject):
+    def __init__(self, remove_wfm: Callable[[str], None], list_widget: QListWidget):
+        super().__init__()
+        self.remove_wfm = remove_wfm
+        self.list_widget = list_widget
+
+    def eventFilter(self, source, event):
+        if (
+            source is self.list_widget
+            and event.type() == QEvent.KeyPress
+            and event.key() == Qt.Key_Delete
+        ):
+            current_item = self.list_widget.currentItem()
+            if current_item is not None:
+                self.remove_wfm(current_item.text())
+            return True
+        return super().eventFilter(source, event)
 
 
 def config_log(dafault_loglevel="INFO"):
