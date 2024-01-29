@@ -17,9 +17,6 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
 ]
 
-[tool.setuptools.packages.find]
-include = ["icon.png"]
-
 [project.urls]
 Homepage = "https://github.com/Qiujv/WaveMonitor"
 

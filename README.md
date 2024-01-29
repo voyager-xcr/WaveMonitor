@@ -43,6 +43,12 @@ monitor.remove_wfm("wave_10")
 
 ```
 
+# Notes
+
+Seems distribute the package with an icon file is mission impossible.
+If you want, download the icon.png here and place it in there you find the `wave_monitor.py` file could work.
+The icon is from https://www.freepik.com/icons/oscilloscope and made by piksart.
+
 # Thanks
 
 This project is derived from [WaveViewer](https://github.com/kahojyun/wave-viewer).
