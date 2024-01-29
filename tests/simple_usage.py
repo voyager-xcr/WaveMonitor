@@ -2,7 +2,7 @@ from wave_monitor import WaveMonitor
 import numpy as np
 
 monitor = WaveMonitor()
-monitor.run_monitor_window("DEBUG")
+monitor.find_or_run_monitor_window("DEBUG")
 monitor.autoscale()
 # monitor.clear()
 

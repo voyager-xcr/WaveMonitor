@@ -12,6 +12,12 @@ In GUI, right click to show the menu. Keyboard shortcuts are also supported.
 pip install wave-monitor
 ```
 
+or install from source.
+
+```bash
+pip install git+https://github.com/Qiujv/LabCodes.git
+```
+
 # Usage
 Avoid calling `clear` if you only want to update the plot. It is more efficient to update the plot with `add_wfm`.
 
@@ -20,7 +26,7 @@ from wave_monitor import WaveMonitor
 import numpy as np
 
 monitor = WaveMonitor()
-monitor.run_monitor_window("DEBUG")
+monitor.find_or_run_monitor_window("DEBUG")
 monitor.autoscale()
 # monitor.clear()
 

@@ -2,7 +2,7 @@
 
 Usage:
     monitor = WaveMonitor()
-    monitor.run_monitor_window()
+    monitor.find_or_run_monitor_window()
 """
 
 import logging
@@ -45,6 +45,7 @@ about_message = (
     "by Jiawei Qiu"
 )
 logger = logging.getLogger(__name__)
+HEAD_LENGTH = 10  # bytes
 
 
 class WaveMonitor:
@@ -52,15 +53,13 @@ class WaveMonitor:
 
     Before using it, start a new monitor window by either of following methods:
 
-    1. Call monitor.run_monitor_window(). This creates a new process for app event loop.
+    1. Call monitor.find_or_run_monitor_window().
 
     2. Run this script, which blocks the process for app event loop.
 
-    Based on QLocalSocket (like named pipe). Messages are serialized with msgpack.
-
     Note:
-        The wrapper is not intend for Qt application, which means no event loop,
-        also no signals or slots.
+        The wrapper is not intend for Qt application, which means neither event loop,
+        no receiving/emiting signals or slots.
     """
 
     logger = logger.getChild("WaveMonitor")
@@ -81,9 +80,28 @@ class WaveMonitor:
         self.add_wfm(name, t, ys)
 
     def add_wfm(self, name: str, t: np.ndarray, ys: list[np.ndarray]) -> None:
+        if not isinstance(name, str):
+            raise TypeError("name must be a string")
+        if not isinstance(t, np.ndarray):
+            raise TypeError("t must be a numpy array")
+        if not isinstance(ys, list):
+            raise TypeError("ys must be a list")
+        if t.ndim != 1:
+            raise ValueError("t must be 1D")
+        for y in ys:
+            if not isinstance(y, np.ndarray):
+                raise TypeError("ys must be a list of numpy arrays")
+            if y.ndim != 1:
+                raise ValueError("ys must be a list of 1D numpy arrays")
+            if y.shape != t.shape:
+                raise ValueError("ys must have the same shape as t")
+            
         self.write(dict(_type="add_wfm", name=name, t=t, ys=ys))
 
     def remove_wfm(self, name: str) -> None:
+        if not isinstance(name, str):
+            raise TypeError("name must be a string")
+        
         self.write(dict(_type="remove_wfm", name=name))
 
     def clear(self) -> None:
@@ -96,10 +114,13 @@ class WaveMonitor:
         if self.sock.state() != QLocalSocket.ConnectedState:
             raise RuntimeError("Socket not connected")
 
-        msg = dump(msg) + b"\n"  # Add a newline to indicate the end of message.
-        self.sock.write(len(msg).to_bytes(9) + b"\n")  # first 10 bytes is msg length
+        msg = msgpack.packb(msg, default=msgpack_numpy.encode)
+        msg += b"\n"  # Add a newline to indicate the end of message.
+        self.sock.write(
+            len(msg).to_bytes(HEAD_LENGTH - 1) + b"\n"
+        )  # Inform msg length.
         self.sock.waitForBytesWritten()
-        self.sock.write(msg)  # Send the message
+        self.sock.write(msg)
 
     def query(self, msg: dict, timeout_ms: int = 1000) -> bytes:
         # BUG: timeout if too much previous data waitting to send. Maybe flush hleps.
@@ -111,27 +132,20 @@ class WaveMonitor:
             msg = b""
         return msg
 
-    def query_and_decode(self, msg: dict, timeout_ms: int = 1000) -> Any:
-        reply = self.query(msg, timeout_ms)
-        if reply:
-            return load(reply)
-        else:
-            return None
-
     def disconnect(self) -> None:
         self.sock.disconnectFromServer()
         if self.sock.state() == QLocalSocket.ConnectedState:
             if not self.sock.waitForDisconnected():
                 raise RuntimeError("Could not disconnect from server")
 
-    def confirm_connect(self, timeout_ms: int = 100) -> bool:
+    def refresh_connect(self, timeout_ms: int = 100) -> bool:
         """Connect to server and returns success status."""
         self.disconnect()  # Refresh the state, otherwise the state is still connected.
         self.sock.connectToServer(PIPE_NAME)
         result = self.sock.waitForConnected(timeout_ms)
         return result
 
-    def run_monitor_window(
+    def find_or_run_monitor_window(
         self,
         log_level: Literal["WARNING", "INFO", "DEBUG"] = "INFO",
         aviod_multiple: bool = True,
@@ -143,17 +157,17 @@ class WaveMonitor:
         """
         cmd = ["cmd", "/c", "start", sys.executable, __file__, f"--log={log_level}"]
 
-        if not self.confirm_connect(timeout_ms=100):
+        if not self.refresh_connect(timeout_ms=100):
             subprocess.run(cmd)
         elif aviod_multiple:
             self.logger.info("Monitor is already running, not starting a new one.")
-            return None
+            return 
         else:
             subprocess.run(cmd)
             warnings.warn("Monitor is already running, starting a duplicate one.")
 
         start_time = time.time()
-        while not self.confirm_connect(timeout_ms=100):
+        while not self.refresh_connect(timeout_ms=100):
             if time.time() - start_time > timeout_s:
                 raise RuntimeError("Timeout waiting for server to start listening.")
             time.sleep(0.1)
@@ -201,9 +215,9 @@ class DataSource(QLocalServer):
         while self.client_connection.canReadLine():
             # Read the msg length.
             if self.expected_msg_length is None:
-                if self.client_connection.bytesAvailable() < 10:
+                if self.client_connection.bytesAvailable() < HEAD_LENGTH:
                     continue
-                line = self.client_connection.read(10).data()
+                line = self.client_connection.read(HEAD_LENGTH).data()
                 try:
                     self.expected_msg_length = int.from_bytes(line[:-1])
                     logger.debug(f"Expecting {self.expected_msg_length} bytes for msg.")
@@ -229,7 +243,9 @@ class DataSource(QLocalServer):
                 continue
 
             # Process the message
-            msg = load(self.partial_msg[:-1])
+            msg = msgpack.unpackb(
+                self.partial_msg[:-1], object_hook=msgpack_numpy.decode
+            )
             self.partial_msg = b""
             self.expected_msg_length = None
 
@@ -261,22 +277,12 @@ class DataSource(QLocalServer):
         super().close()
 
 
-def dump(payload: Any) -> bytes:
-    """Serialize payload with msgpack."""
-    return msgpack.packb(payload, default=msgpack_numpy.encode)
-
-def load(payload: bytes) -> Any:
-    """Deserialize payload with msgpack."""
-    return msgpack.unpackb(payload, object_hook=msgpack_numpy.decode)
-
-
 class MonitorWindow:
     """Keep some widgets and plot waveforms with them."""
 
     logger = logger.getChild("MonitorWindow")
 
     def __init__(self, wfm_seperation: float = 2):
-        """Construct widgets."""
         MonitorWindow.setup_app_style(QApplication.instance())
         window = QMainWindow()
         window.setWindowTitle("Wave Monitor")
