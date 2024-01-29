@@ -1,4 +1,4 @@
-"""A simple waveform monitor.
+"""A simple GUI for monitoring waveforms.
 
 Usage:
     monitor = WaveMonitor()
@@ -38,10 +38,10 @@ from PySide6.QtWidgets import (
 )
 
 PIPE_NAME = "wave_monitor"
-__version__ = "0.1.0"
+__version__ = "0.0.1"
 about_message = (
     f"<b>Wave Monitor</b> v{__version__}<br><br>"
-    "A simple waveform monitor.<br><br>"
+    "A simple GUI for monitoring waveforms.<br><br>"
     "by Jiawei Qiu"
 )
 logger = logging.getLogger(__name__)
@@ -72,7 +72,12 @@ class WaveMonitor:
     def add_line(
         self, name: str, t: np.ndarray, ys: list[np.ndarray], offset: float
     ) -> None:
-        warnings.warn("Use add_wfm instead.", DeprecationWarning)
+        # For compatibility, TODO: remove this.
+        warnings.warn(
+            "Use add_wfm instead. This will be removed by v0.1",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.add_wfm(name, t, ys)
 
     def add_wfm(self, name: str, t: np.ndarray, ys: list[np.ndarray]) -> None:
@@ -91,13 +96,13 @@ class WaveMonitor:
         if self.sock.state() != QLocalSocket.ConnectedState:
             raise RuntimeError("Socket not connected")
 
-        msg = msgpack.packb(msg, default=msgpack_numpy.encode)
-        msg = msg + b"\n"  # Add a newline to indicate the end of message.
-        self.sock.write(msgpack.packb(len(msg)) + b"\n")
+        msg = dump(msg) + b"\n"  # Add a newline to indicate the end of message.
+        self.sock.write(len(msg).to_bytes(9) + b"\n")  # first 10 bytes is msg length
         self.sock.waitForBytesWritten()
         self.sock.write(msg)  # Send the message
 
-    def query(self, msg: dict, timeout_ms: int = 100) -> bytes:
+    def query(self, msg: dict, timeout_ms: int = 1000) -> bytes:
+        # BUG: timeout if too much previous data waitting to send. Maybe flush hleps.
         self.write(msg)
         self.sock.waitForBytesWritten()  # Make sure bytes written.
         if self.sock.waitForReadyRead(timeout_ms):
@@ -106,10 +111,10 @@ class WaveMonitor:
             msg = b""
         return msg
 
-    def query_and_decode(self, msg: dict, timeout_ms: int = 100) -> Any:
+    def query_and_decode(self, msg: dict, timeout_ms: int = 1000) -> Any:
         reply = self.query(msg, timeout_ms)
         if reply:
-            return msgpack.unpackb(reply, object_hook=msgpack_numpy.decode)
+            return load(reply)
         else:
             return None
 
@@ -185,27 +190,35 @@ class DataSource(QLocalServer):
     def handle_new_connection(self):
         self.close_client_connection()
         self.client_connection = self.nextPendingConnection()
-        self.client_connection.readyRead.connect(self.read_client_and_emit)
+        self.client_connection.readyRead.connect(self.assmeble_message)
         self.client_connection.disconnected.connect(
             lambda: self.logger.info("Client disconnected.")
         )
         self.logger.info("New client connected.")
 
-    def read_client_and_emit(self):
+    def assmeble_message(self):
         # One readyRead signal may contain multiple messages.
         while self.client_connection.canReadLine():
             # Read the msg length.
             if self.expected_msg_length is None:
-                line = self.client_connection.readLine().data().strip()
-                self.expected_msg_length = msgpack.unpackb(
-                    line, object_hook=msgpack_numpy.decode
-                )
-                logger.debug(f"Expecting {self.expected_msg_length} bytes for msg.")
-                continue
+                if self.client_connection.bytesAvailable() < 10:
+                    continue
+                line = self.client_connection.read(10).data()
+                try:
+                    self.expected_msg_length = int.from_bytes(line[:-1])
+                    logger.debug(f"Expecting {self.expected_msg_length} bytes for msg.")
+                except:
+                    logger.exception(f"Failed to parse msg length: {line}")
+                    continue
 
             # Read the msg.
-            line = self.client_connection.readLine().data()
-            self.partial_msg += line
+            if self.client_connection.bytesAvailable() < self.expected_msg_length:
+                continue
+
+            msg = self.client_connection.read(self.expected_msg_length).data()
+            logger.debug(f"Received {len(msg)} bytes.")
+            self.partial_msg += msg
+            self.expected_msg_length -= len(msg)
 
             if len(self.partial_msg) < self.expected_msg_length:
                 self.logger.debug(
@@ -213,13 +226,10 @@ class DataSource(QLocalServer):
                     len(self.partial_msg),
                     self.expected_msg_length,
                 )
-                time.sleep(0.1)
                 continue
 
             # Process the message
-            msg = msgpack.unpackb(
-                self.partial_msg.strip(), object_hook=msgpack_numpy.decode
-            )
+            msg = load(self.partial_msg[:-1])
             self.partial_msg = b""
             self.expected_msg_length = None
 
@@ -242,13 +252,22 @@ class DataSource(QLocalServer):
 
     def close_client_connection(self):
         if hasattr(self, "client_connection"):
-            self.client_connection.readyRead.disconnect(self.read_client_and_emit)
+            self.client_connection.readyRead.disconnect(self.assmeble_message)
             self.client_connection.close()  # Not working, because client not in qt event loop.
 
     def close(self):
         self.close_client_connection()
         self.logger.info('Closing server "%s".', PIPE_NAME)
         super().close()
+
+
+def dump(payload: Any) -> bytes:
+    """Serialize payload with msgpack."""
+    return msgpack.packb(payload, default=msgpack_numpy.encode)
+
+def load(payload: bytes) -> Any:
+    """Deserialize payload with msgpack."""
+    return msgpack.unpackb(payload, object_hook=msgpack_numpy.decode)
 
 
 class MonitorWindow:
