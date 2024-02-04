@@ -17,16 +17,8 @@ import msgpack
 import msgpack_numpy
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QEvent, QObject, QPointF, Qt, Signal, Slot
-from PySide6.QtGui import (
-    QAction,
-    QColor,
-    QFont,
-    QIcon,
-    QMouseEvent,
-    QPalette,
-    QShortcut,
-)
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, Qt, Signal, Slot
+from PySide6.QtGui import QAction, QFont, QIcon, QMouseEvent, QShortcut
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
@@ -53,6 +45,7 @@ about_message = (
 )
 logger = logging.getLogger(__name__)
 HEAD_LENGTH = 10  # bytes
+N_VISIBLE_WFMS = 100
 
 
 class WaveMonitor:
@@ -321,11 +314,8 @@ class MonitorWindow:
         plot_widget.viewport().installEventFilter(_filter)
         self._right_click_filter = _filter
 
-        dock_widget = QDockWidget("wfms⪅30", window)
+        dock_widget = QDockWidget(f"wfms⪅{N_VISIBLE_WFMS}", window)
         dock_widget.setFloating(False)
-        dock_widget.setStyleSheet(
-            "QScrollBar:vertical {width: 10px;}" "QScrollBar:horizontal {height: 10px;}"
-        )
         window.addDockWidget(Qt.RightDockWidgetArea, dock_widget)
         font_metrics = dock_widget.fontMetrics()
         initial_width = font_metrics.horizontalAdvance("X") * 15  # 15 chars wide.
@@ -334,6 +324,9 @@ class MonitorWindow:
         dock_layout = QVBoxLayout()
         list_widget = QListWidget()
         list_widget.setDragDropMode(QListWidget.InternalMove)
+        list_widget.setSelectionMode(QListWidget.ExtendedSelection)
+        list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
+        list_widget.customContextMenuRequested.connect(self.show_list_context_menu)
         _filter = DeleteEventFilter(self.remove_wfm, list_widget)
         list_widget.installEventFilter(_filter)
         self._delete_event_filter = _filter
@@ -388,7 +381,7 @@ class MonitorWindow:
             visible_wfms = self.visible_wfms
             offset = self.wfm_separation * len(visible_wfms)
             wfm = Waveform(name, t, ys, offset, self.plot_item, self.list_widget)
-            if len(visible_wfms) >= 30:
+            if len(visible_wfms) >= N_VISIBLE_WFMS:
                 wfm.set_visible(False)
             self.wfms[name] = wfm
 
@@ -491,34 +484,54 @@ class MonitorWindow:
 
         context_menu.exec(self.plot_widget.mapToGlobal(pos.toPoint()))
 
+    def show_list_context_menu(self, pos: QPoint):
+        context_menu = QMenu(self.list_widget)
+
+        show_action = QAction("Show selected", self.dock_widget)
+
+        def show_selected_wfms():
+            for item in self.list_widget.selectedItems():
+                self.wfms[item.text()].set_visible(True)
+
+        show_action.triggered.connect(show_selected_wfms)
+        context_menu.addAction(show_action)
+
+        remove_action = QAction("Remove selected (Del)", self.dock_widget)
+
+        def remove_selected_wfms():
+            for item in self.list_widget.selectedItems():
+                self.remove_wfm(item.text())
+
+        remove_action.triggered.connect(remove_selected_wfms)
+        context_menu.addAction(remove_action)
+
+        hide_action = QAction("Hide selected", self.dock_widget)
+
+        def hide_selected_wfms():
+            for item in self.list_widget.selectedItems():
+                self.wfms[item.text()].set_visible(False)
+
+        hide_action.triggered.connect(hide_selected_wfms)
+        context_menu.addAction(hide_action)
+
+        context_menu.exec(self.list_widget.mapToGlobal(pos))
+
     def show_about_dialog(self):
         QMessageBox.about(self.window, "About Wave Monitor", about_message)
 
     @staticmethod
     def setup_app_style(app: QApplication) -> None:
-        """Set the window style to Dark Fusion and use Segoe UI font."""
         app.setStyle("Fusion")
         app.setFont(QFont("Segoe UI", 10))
+        # app.setAttribute(Qt.AA_DontShowIconsInMenus, True)
 
-        dark_palette = QPalette()
-        dark_palette.setColor(QPalette.Window, QColor(53, 53, 53))
-        dark_palette.setColor(QPalette.WindowText, Qt.white)
-        dark_palette.setColor(QPalette.Base, QColor(25, 25, 25))
-        dark_palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
-        dark_palette.setColor(QPalette.ToolTipBase, Qt.white)
-        dark_palette.setColor(QPalette.ToolTipText, Qt.white)
-        dark_palette.setColor(QPalette.Text, Qt.white)
-        dark_palette.setColor(QPalette.Button, QColor(53, 53, 53))
-        dark_palette.setColor(QPalette.ButtonText, Qt.white)
-        dark_palette.setColor(QPalette.BrightText, Qt.red)
-        dark_palette.setColor(QPalette.Link, QColor(42, 130, 218))
-        dark_palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
-        dark_palette.setColor(QPalette.HighlightedText, Qt.black)
-        app.setPalette(dark_palette)
+        with open(Path(__file__).parent / "style.qss", "r") as f:
+            _style = f.read()
+            app.setStyleSheet(_style)
 
     def _add_test_wfm(self):
         i = len(self.wfms)
-        t = np.linspace(0, 1, 100_001)
+        t = np.linspace(0, 1, 1_000_001)
         i_wave = np.cos(2 * np.pi * i * t)
         q_wave = np.sin(2 * np.pi * i * t)
         self.add_wfm(f"test_wfm_{i}", t, [i_wave, q_wave])
@@ -702,9 +715,8 @@ class DeleteEventFilter(QObject):
             and event.type() == QEvent.KeyPress
             and event.key() == Qt.Key_Delete
         ):
-            current_item = self.list_widget.currentItem()
-            if current_item is not None:
-                self.remove_wfm(current_item.text())
+            for item in self.list_widget.selectedItems():
+                self.remove_wfm(item.text())
             return True
         return super().eventFilter(source, event)
 
