@@ -31,11 +31,17 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
     QDockWidget,
+    QDoubleSpinBox,
+    QHBoxLayout,
+    QLabel,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
 )
 
 PIPE_NAME = "wave_monitor"
@@ -96,13 +102,13 @@ class WaveMonitor:
                 raise ValueError("ys must be a list of 1D numpy arrays")
             if y.shape != t.shape:
                 raise ValueError("ys must have the same shape as t")
-            
+
         self.write(dict(_type="add_wfm", name=name, t=t, ys=ys))
 
     def remove_wfm(self, name: str) -> None:
         if not isinstance(name, str):
             raise TypeError("name must be a string")
-        
+
         self.write(dict(_type="remove_wfm", name=name))
 
     def clear(self) -> None:
@@ -162,7 +168,7 @@ class WaveMonitor:
             subprocess.run(cmd)
         elif aviod_multiple:
             self.logger.info("Monitor is already running, not starting a new one.")
-            return 
+            return
         else:
             subprocess.run(cmd)
             warnings.warn("Monitor is already running, starting a duplicate one.")
@@ -182,7 +188,7 @@ class WaveMonitor:
 
 
 class DataSource(QLocalServer):
-    """Receive messages from MonitorWrapper and emit signals to trigger operation on monitor."""
+    """Receive messages from client and emit signals to trigger operation on monitor."""
 
     add_wfm = Signal(str, np.ndarray, list)
     remove_wfm = Signal(str)
@@ -197,13 +203,15 @@ class DataSource(QLocalServer):
 
         self.newConnection.connect(self.handle_new_connection)
         QApplication.instance().aboutToQuit.connect(self.close)
+
         # Remove previous instance. see https://doc.qt.io/qtforpython-6/PySide6/QtNetwork/QLocalServer.html#PySide6.QtNetwork.PySide6.QtNetwork.QLocalServer.removeServer
         # self.removeServer(PIPE_NAME)  # Remove previous instance.
         self.listen(PIPE_NAME)
+
         self.logger.info('Listening on "%s".', PIPE_NAME)
 
     def handle_new_connection(self):
-        self.close_client_connection()
+        self.close_client_connection()  # Close previous connection.
         self.client_connection = self.nextPendingConnection()
         self.client_connection.readyRead.connect(self.assmeble_message)
         self.client_connection.disconnected.connect(
@@ -283,7 +291,7 @@ class MonitorWindow:
 
     logger = logger.getChild("MonitorWindow")
 
-    def __init__(self, wfm_seperation: float = 2):
+    def __init__(self, wfm_separation: float = 2):
         MonitorWindow.setup_app_style(QApplication.instance())
         window = QMainWindow()
         window.setWindowTitle("Wave Monitor")
@@ -314,12 +322,6 @@ class MonitorWindow:
         self._right_click_filter = _filter
 
         dock_widget = QDockWidget("wfms⪅30", window)
-        list_widget = QListWidget()
-        list_widget.setDragDropMode(QListWidget.InternalMove)
-        _filter = DeleteEventFilter(self.remove_wfm, list_widget)
-        list_widget.installEventFilter(_filter)
-        self._delete_event_filter = _filter
-        dock_widget.setWidget(list_widget)
         dock_widget.setFloating(False)
         dock_widget.setStyleSheet(
             "QScrollBar:vertical {width: 10px;}" "QScrollBar:horizontal {height: 10px;}"
@@ -328,6 +330,38 @@ class MonitorWindow:
         font_metrics = dock_widget.fontMetrics()
         initial_width = font_metrics.horizontalAdvance("X") * 15  # 15 chars wide.
         window.resizeDocks([dock_widget], [initial_width], Qt.Horizontal)
+
+        dock_layout = QVBoxLayout()
+        list_widget = QListWidget()
+        list_widget.setDragDropMode(QListWidget.InternalMove)
+        _filter = DeleteEventFilter(self.remove_wfm, list_widget)
+        list_widget.installEventFilter(_filter)
+        self._delete_event_filter = _filter
+        dock_layout.addWidget(list_widget)
+
+        input_layout = QHBoxLayout()
+        label = QLabel("sep.")
+        label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        input_layout.addWidget(label)
+        wfm_separation_input = QDoubleSpinBox()
+        wfm_separation_input.setValue(wfm_separation)
+        wfm_separation_input.setMinimum(0)
+        wfm_separation_input.setSingleStep(0.5)
+        wfm_separation_input.setDecimals(1)
+        wfm_separation_input.valueChanged.connect(
+            lambda value: setattr(self, "wfm_separation", value)
+        )
+        wfm_separation_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        input_layout.addWidget(wfm_separation_input)
+        dock_layout.addLayout(input_layout)
+
+        dock_layout.setSpacing(1)
+        dock_layout.setContentsMargins(0, 0, 0, 0)
+        input_layout.setSpacing(1)
+        input_layout.setContentsMargins(0, 0, 0, 0)
+        dock_content = QWidget()
+        dock_content.setLayout(dock_layout)
+        dock_widget.setWidget(dock_content)
 
         server = DataSource(window)
         server.add_wfm.connect(self.add_wfm)
@@ -344,7 +378,7 @@ class MonitorWindow:
         self.dock_widget = dock_widget
         self.list_widget = list_widget
         self.server = server
-        self.wfm_seperation = wfm_seperation
+        self.wfm_separation = wfm_separation
 
     def add_wfm(self, name: str, t: np.ndarray, ys: list[np.ndarray]):
         if name in self.wfms:
@@ -352,14 +386,14 @@ class MonitorWindow:
             wfm.update_wfm(t, ys)
         else:
             visible_wfms = self.visible_wfms
-            offset = self.wfm_seperation * len(visible_wfms)
+            offset = self.wfm_separation * len(visible_wfms)
             wfm = Waveform(name, t, ys, offset, self.plot_item, self.list_widget)
-            if len(visible_wfms) >= 20:
+            if len(visible_wfms) >= 30:
                 wfm.set_visible(False)
             self.wfms[name] = wfm
 
     def hide_all(self):
-        for wfm in self.wfms.values():
+        for wfm in self.visible_wfms:
             wfm.set_visible(False)
 
     def remove_wfm(self, name: str):
@@ -367,7 +401,7 @@ class MonitorWindow:
             self.wfms[name].remove()
             del self.wfms[name]
         else:
-            self.logger.debug(f"Waveform {name} not found, nothing removed.")
+            self.logger.warning(f"Waveform {name} not found, nothing removed.")
 
     def clear(self):
         for name in list(self.wfms.keys()):
@@ -386,16 +420,17 @@ class MonitorWindow:
             self.clear()
 
     def autoscale(self):
-        if self.wfms:
-            t0 = min(wfm.t0 for wfm in self.wfms.values())
-            t1 = max(wfm.t1 for wfm in self.wfms.values())
-            y0 = min(wfm.offset for wfm in self.wfms.values()) - 1
-            y1 = max(wfm.offset for wfm in self.wfms.values()) + 1
+        visible_wfms = self.visible_wfms
+        if visible_wfms:
+            t0 = min(wfm.t0 for wfm in visible_wfms)
+            t1 = max(wfm.t1 for wfm in visible_wfms)
+            y0 = min(wfm.offset for wfm in visible_wfms) - self.wfm_separation / 2
+            y1 = max(wfm.offset for wfm in visible_wfms) + self.wfm_separation / 2
             self.plot_item.setRange(xRange=(t0, t1), yRange=(y0, y1))
 
     def refresh_plots(self):
         for i, wfm in enumerate(self.visible_wfms):
-            wfm.update_offset(self.wfm_seperation * i)
+            wfm.update_offset(self.wfm_separation * i)
 
     @property
     def visible_wfms(self) -> list["Waveform"]:
