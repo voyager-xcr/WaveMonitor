@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 import warnings
-from pathlib import Path
+from importlib.resources import files
 from typing import Any, Callable, Literal
 
 import msgpack
@@ -18,7 +18,7 @@ import msgpack_numpy
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, Qt, Signal, Slot
-from PySide6.QtGui import QAction, QFont, QIcon, QMouseEvent, QShortcut
+from PySide6.QtGui import QAction, QIcon, QMouseEvent, QShortcut
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
@@ -288,11 +288,10 @@ class MonitorWindow:
         MonitorWindow.setup_app_style(QApplication.instance())
         window = QMainWindow()
         window.setWindowTitle("Wave Monitor")
-        window.setWindowIcon(QIcon(str(Path(__file__).parent / "icon.png")))
+        window.setWindowIcon(QIcon(str(files("assets").joinpath("icon.png"))))
         QShortcut("F", window).activated.connect(self.autoscale)
         QShortcut("C", window).activated.connect(self.confirm_clear)
         QShortcut("R", window).activated.connect(self.refresh_plots)
-        QShortcut("H", window).activated.connect(self.hide_all)
         QShortcut("Shift+A", window).activated.connect(self._add_test_wfm)
         QShortcut("Shift+1", window).activated.connect(self._add_test_wfm1)
 
@@ -333,7 +332,7 @@ class MonitorWindow:
         dock_layout.addWidget(list_widget)
 
         input_layout = QHBoxLayout()
-        label = QLabel("sep.")
+        label = QLabel("sep. ")
         label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         input_layout.addWidget(label)
         wfm_separation_input = QDoubleSpinBox()
@@ -384,10 +383,6 @@ class MonitorWindow:
             if len(visible_wfms) >= N_VISIBLE_WFMS:
                 wfm.set_visible(False)
             self.wfms[name] = wfm
-
-    def hide_all(self):
-        for wfm in self.visible_wfms:
-            wfm.set_visible(False)
 
     def remove_wfm(self, name: str):
         if name in self.wfms:
@@ -456,18 +451,6 @@ class MonitorWindow:
         refresh_action.triggered.connect(self.refresh_plots)
         context_menu.addAction(refresh_action)
 
-        hide_all_action = QAction("Hide all (H)", self.window)
-        hide_all_action.triggered.connect(self.hide_all)
-        context_menu.addAction(hide_all_action)
-
-        clear_action = QAction("Clear all (C)", self.window)
-        clear_action.triggered.connect(self.confirm_clear)
-        context_menu.addAction(clear_action)
-
-        sort_action = QAction('Sort "wfms" list', self.window)
-        sort_action.triggered.connect(self.list_widget.sortItems)
-        context_menu.addAction(sort_action)
-
         dock_restore_action = QAction('Restore "wfms" list', self.window)
         dock_restore_action.triggered.connect(self.restore_dock)
         context_menu.addAction(dock_restore_action)
@@ -496,15 +479,6 @@ class MonitorWindow:
         show_action.triggered.connect(show_selected_wfms)
         context_menu.addAction(show_action)
 
-        remove_action = QAction("Remove selected (Del)", self.dock_widget)
-
-        def remove_selected_wfms():
-            for item in self.list_widget.selectedItems():
-                self.remove_wfm(item.text())
-
-        remove_action.triggered.connect(remove_selected_wfms)
-        context_menu.addAction(remove_action)
-
         hide_action = QAction("Hide selected", self.dock_widget)
 
         def hide_selected_wfms():
@@ -514,6 +488,23 @@ class MonitorWindow:
         hide_action.triggered.connect(hide_selected_wfms)
         context_menu.addAction(hide_action)
 
+        remove_action = QAction("Remove selected (Del)", self.dock_widget)
+
+        def remove_selected_wfms():
+            for item in self.list_widget.selectedItems():
+                self.remove_wfm(item.text())
+
+        remove_action.triggered.connect(remove_selected_wfms)
+        context_menu.addAction(remove_action)
+
+        clear_action = QAction("Clear all (C)", self.window)
+        clear_action.triggered.connect(self.confirm_clear)
+        context_menu.addAction(clear_action)
+
+        sort_action = QAction('Sort list', self.window)
+        sort_action.triggered.connect(self.list_widget.sortItems)
+        context_menu.addAction(sort_action)
+
         context_menu.exec(self.list_widget.mapToGlobal(pos))
 
     def show_about_dialog(self):
@@ -521,11 +512,7 @@ class MonitorWindow:
 
     @staticmethod
     def setup_app_style(app: QApplication) -> None:
-        app.setStyle("Fusion")
-        app.setFont(QFont("Segoe UI", 10))
-        # app.setAttribute(Qt.AA_DontShowIconsInMenus, True)
-
-        with open(Path(__file__).parent / "style.qss", "r") as f:
+        with open(files("assets").joinpath("style.qss"), "r") as f:
             _style = f.read()
             app.setStyleSheet(_style)
 

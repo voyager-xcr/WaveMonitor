@@ -2,15 +2,67 @@
 Adopted by Jiawei Qiu.
 */
 
-QDockWidget QScrollBar:vertical {
+QScrollBar:vertical {
     width: 10px;
 }
-QDockWidget QScrollBar:horizontal {
+QScrollBar:horizontal {
     height: 10px;
 }
 QListWidget::item {
-    min-height: 18px;
+    height: 18px;
 }
+QDockWidget,
+QListWidget{
+	background-color: #2e2e2e;
+    color: #FFFFFF;
+}
+ApplicationPalette {
+  qproperty-window: #2e2e2e;
+  qproperty-windowtext: #eee;
+  qproperty-windowtext_disabled: #484848;
+  qproperty-base: #191919;
+  qproperty-alternatebase: #2d2d2d;
+  qproperty-text: #d8d8d8;
+  qproperty-text_disabled: #484848;
+  qproperty-tooltipbase: #191919;
+  qproperty-tooltiptext: #d8d8d8;
+  qproperty-tooltiptext_disabled: #484848;
+  qproperty-brighttext: #FFF;
+  qproperty-brighttext_disabled: #484848;
+  qproperty-highlight: #298ce1;
+  qproperty-highlightedtext: #FFF;
+  qproperty-highlightedtext_disabled: #484848;
+  qproperty-button: #444;
+  qproperty-buttontext: #d8d8d8;
+  qproperty-buttontext_disabled: #484848;
+  qproperty-link: #39a5dd;
+  qproperty-linkvisited: #39a5dd;
+  qproperty-light: #1c1c1c;
+  qproperty-midlight: transparent;
+  qproperty-mid: #1c1c1c;
+  qproperty-dark: transparent;
+  qproperty-shadow: #1c1c1c;
+}
+
+QObject,
+QObject::separator,
+QObject::handle,
+QObject::tab-bar,
+QObject::tab,
+QObject::section {
+  font-family: "Segoe UI", Frutiger, "Frutiger Linotype", "Dejavu Sans", "Helvetica Neue", "Microsoft YaHei UI", "PingFang SC", "Noto Sans SC", Arial, sans-serif;
+  font-size: 10pt;
+  margin: 0;
+  padding: 0;
+  outline: 0;
+  border: 0;
+  selection-background-color: #298ce1;
+  selection-color: #FFF;
+  alternate-background-color: transparent;
+  color: #eee;
+  border-radius: 2px;
+}
+
 
 /*
 Material Dark Style Sheet for QT Applications
@@ -182,7 +234,7 @@ QMenu::item:selected {
 	padding-top:4px;
 	padding-bottom:4px;
 	padding-right:7px;
-	background-color: #1e1d23;
+	background-color: #3e4f5e;
 }
 QMenu::item {
 	border-style: solid;
@@ -310,12 +362,12 @@ QStatusBar {
 	color:#027f7f;
 }
 QSpinBox {
-	color: #a9b7c6;	
-	background-color: #1e1d23;
+	color: #FFFFFF;	
+	background-color: #2e2e2e;
 }
 QDoubleSpinBox {
-	color: #a9b7c6;	
-	background-color: #1e1d23;
+	color: #FFFFFF;	
+	background-color: #2e2e2e;
 }
 QTimeEdit {
 	color: #a9b7c6;	
