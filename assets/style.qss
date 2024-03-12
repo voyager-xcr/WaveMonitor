@@ -2,12 +2,65 @@
 Adopted by Jiawei Qiu.
 */
 
+QScrollBar {
+  border-radius: 0;
+  font-size: 10pt;
+}
+
 QScrollBar:vertical {
-    width: 10px;
+  border-left: 1px solid #1c1c1c;
+  width: 0.5em;
 }
+
 QScrollBar:horizontal {
-    height: 10px;
+  border-top: 1px solid #1c1c1c;
+  height: 0.5em;
 }
+
+QScrollBar::handle {
+  margin: -1px;
+  background: #666;
+  border: 1px solid #1c1c1c;
+}
+
+QScrollBar::handle:vertical {
+  min-height: 10px;
+}
+
+QScrollBar::handle:horizontal {
+  min-width: 10px;
+}
+
+QScrollBar::handle:hover {
+  background: #888;
+}
+
+QScrollBar::left-arrow,
+QScrollBar::right-arrow,
+QScrollBar::up-arrow,
+QScrollBar::down-arrow,
+QScrollBar::sub-line,
+QScrollBar::add-line,
+QScrollBar::add-page,
+QScrollBar::sub-page {
+  background: #2e2e2e;
+  height: 0;
+  width: 0;
+  border-radius: 0;
+  border: 0;
+}
+
+QAbstractScrollArea::corner {
+  border-left: 1px solid #1c1c1c;
+  border-top: 1px solid #1c1c1c;
+  height: 0;
+  width: 0;
+  border-radius: 0;
+  border-top: 1px solid #1c1c1c;
+  border-left: 1px solid #1c1c1c;
+  background: #191919;
+}
+
 QListWidget::item {
     height: 18px;
 }
@@ -413,10 +466,6 @@ QToolBox::tab {
 	background-color: #1e1d23;
 }
 QToolBox::tab:selected {
-	color: #FFFFFF;
-	background-color: #1e1d23;
-}
-QScrollArea {
 	color: #FFFFFF;
 	background-color: #1e1d23;
 }

@@ -1,5 +1,7 @@
 # Wave Monitor
 
+![snapshot](assets/snapshot.png)
+
 A simple GUI for monitoring waveforms. It plots waveforms with PyQtGraph in a separate process. The GUI is built with PySide6.
 
 The `WaveMonitor` class is the main interface. It provides methods for adding and removing waveforms from the plot, clearing the plot, and etc.
@@ -9,7 +11,7 @@ In GUI, right click to show the menu. Keyboard shortcuts are also supported.
 # Installation
 
 ```bash
-pip install wave-monitor
+pip install WaveMonitor
 ```
 
 or install from source.

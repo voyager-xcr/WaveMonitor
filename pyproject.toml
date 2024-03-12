@@ -1,6 +1,6 @@
 [project]
 name = "WaveMonitor"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
     "msgpack",
     "msgpack_numpy",
@@ -8,13 +8,14 @@ dependencies = [
     "pyqtgraph",
     "PySide6",
 ]
-# requires-python = ">=3.8"
+requires-python = ">=3.8"
 authors = [{ name = "Qiujv", email = "qiujv@outlook.com" }]
 description = "A simple GUI for monitoring waveforms."
 readme = "README.md"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
 ]
 
 [project.urls]

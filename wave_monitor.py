@@ -441,34 +441,34 @@ class MonitorWindow:
             self.dock_widget.show()
 
     def show_context_menu(self, pos: QPointF):
-        context_menu = QMenu(self.plot_widget)
+        menu = QMenu(self.plot_widget)
 
         zoom_fit_action = QAction("Zoom fit (F)", self.window)
         zoom_fit_action.triggered.connect(self.autoscale)
-        context_menu.addAction(zoom_fit_action)
+        menu.addAction(zoom_fit_action)
 
         refresh_action = QAction("Refresh plots (R)", self.window)
         refresh_action.triggered.connect(self.refresh_plots)
-        context_menu.addAction(refresh_action)
+        menu.addAction(refresh_action)
 
         dock_restore_action = QAction('Restore "wfms" list', self.window)
         dock_restore_action.triggered.connect(self.restore_dock)
-        context_menu.addAction(dock_restore_action)
+        menu.addAction(dock_restore_action)
 
         # # Not working. But anyway, it is slow.
         # export_action = QAction("PyQtGraph Export (csv slow!)", self.window)
         # export_action.triggered.connect(self.plot_widget.sceneObj.showExportDialog)
 
-        context_menu.addSeparator()
+        menu.addSeparator()
 
         about_action = QAction("About", self.window)
         about_action.triggered.connect(self.show_about_dialog)
-        context_menu.addAction(about_action)
+        menu.addAction(about_action)
 
-        context_menu.exec(self.plot_widget.mapToGlobal(pos.toPoint()))
+        menu.exec(self.plot_widget.mapToGlobal(pos.toPoint()))
 
     def show_list_context_menu(self, pos: QPoint):
-        context_menu = QMenu(self.list_widget)
+        menu = QMenu(self.list_widget)
 
         show_action = QAction("Show selected", self.dock_widget)
 
@@ -477,7 +477,7 @@ class MonitorWindow:
                 self.wfms[item.text()].set_visible(True)
 
         show_action.triggered.connect(show_selected_wfms)
-        context_menu.addAction(show_action)
+        menu.addAction(show_action)
 
         hide_action = QAction("Hide selected", self.dock_widget)
 
@@ -486,7 +486,7 @@ class MonitorWindow:
                 self.wfms[item.text()].set_visible(False)
 
         hide_action.triggered.connect(hide_selected_wfms)
-        context_menu.addAction(hide_action)
+        menu.addAction(hide_action)
 
         remove_action = QAction("Remove selected (Del)", self.dock_widget)
 
@@ -495,17 +495,17 @@ class MonitorWindow:
                 self.remove_wfm(item.text())
 
         remove_action.triggered.connect(remove_selected_wfms)
-        context_menu.addAction(remove_action)
+        menu.addAction(remove_action)
 
         clear_action = QAction("Clear all (C)", self.window)
         clear_action.triggered.connect(self.confirm_clear)
-        context_menu.addAction(clear_action)
+        menu.addAction(clear_action)
 
         sort_action = QAction('Sort list', self.window)
         sort_action.triggered.connect(self.list_widget.sortItems)
-        context_menu.addAction(sort_action)
+        menu.addAction(sort_action)
 
-        context_menu.exec(self.list_widget.mapToGlobal(pos))
+        menu.exec(self.list_widget.mapToGlobal(pos))
 
     def show_about_dialog(self):
         QMessageBox.about(self.window, "About Wave Monitor", about_message)
