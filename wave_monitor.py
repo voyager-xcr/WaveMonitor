@@ -2,7 +2,7 @@
 
 Usage:
     monitor = WaveMonitor()
-    monitor.find_or_run_monitor_window()
+    monitor.find_or_create_window()
 """
 
 import logging
@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 PIPE_NAME = "wave_monitor"
-__version__ = "0.0.1"
+__version__ = "0.0.3"
 about_message = (
     f"<b>Wave Monitor</b> v{__version__}<br><br>"
     "A simple GUI for monitoring waveforms.<br><br>"
@@ -53,7 +53,7 @@ class WaveMonitor:
 
     Before using it, start a new monitor window by either of following methods:
 
-    1. Call monitor.find_or_run_monitor_window().
+    1. Call monitor.find_or_create_window().
 
     2. Run this script, which blocks the process for app event loop.
 
@@ -64,9 +64,14 @@ class WaveMonitor:
 
     logger = logger.getChild("WaveMonitor")
 
-    def __init__(self) -> None:
+    def __init__(self, create_window: bool = True) -> None:
         self.sock = QLocalSocket()
         self.sock.connectToServer(PIPE_NAME)
+        if create_window:
+            try:
+                self.find_or_create_window()
+            except:
+                logger.exception("Failed to connect to server.")
 
     def add_line(
         self, name: str, t: np.ndarray, ys: list[np.ndarray], offset: float
@@ -145,7 +150,7 @@ class WaveMonitor:
         result = self.sock.waitForConnected(timeout_ms)
         return result
 
-    def find_or_run_monitor_window(
+    def find_or_create_window(
         self,
         log_level: Literal["WARNING", "INFO", "DEBUG"] = "INFO",
         aviod_multiple: bool = True,
@@ -156,14 +161,17 @@ class WaveMonitor:
         Blocks until server is listening.
         """
         cmd = ["cmd", "/c", "start", sys.executable, __file__, f"--log={log_level}"]
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
 
         if not self.refresh_connect(timeout_ms=100):
-            subprocess.run(cmd)
+            subprocess.run(cmd, startupinfo=startupinfo)
         elif aviod_multiple:
             self.logger.info("Monitor is already running, not starting a new one.")
             return
         else:
-            subprocess.run(cmd)
+            subprocess.run(cmd, startupinfo=startupinfo)
             warnings.warn("Monitor is already running, starting a duplicate one.")
 
         start_time = time.time()
