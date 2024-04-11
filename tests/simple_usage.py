@@ -1,8 +1,9 @@
 from wave_monitor import WaveMonitor
 import numpy as np
+import logging
+logging.basicConfig(level=logging.DEBUG)
 
 monitor = WaveMonitor()
-# monitor.find_or_create_window("DEBUG")
 monitor.autoscale()
 # monitor.clear()
 
