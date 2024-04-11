@@ -84,12 +84,12 @@ class WaveMonitor:
     def write(self, msg: dict) -> None:
         if self.sock.state() != QLocalSocket.ConnectedState:
             raise RuntimeError("Socket not connected")
-        
+
         self.logger.debug(f"msg to send: {msg}")
 
         msg = msgpack.packb(msg, default=msgpack_numpy.encode)
         msg += b"\n"  # Add a newline to indicate the end of message.
-        self.sock.write(len(msg).to_bytes(HEAD_LENGTH - 1) + b"\n")  # Inform msg len.
+        self.sock.write(len(msg).to_bytes(HEAD_LENGTH - 1, "big") + b"\n")
         self.sock.waitForBytesWritten()
         self.sock.write(msg)
         self.logger.debug(f"msg sent: {len(msg)} bytes")

@@ -82,7 +82,7 @@ class DataSource(QLocalServer):
                     continue
                 line = self.client_connection.read(HEAD_LENGTH).data()
                 try:
-                    self.expected_msg_length = int.from_bytes(line[:-1])
+                    self.expected_msg_length = int.from_bytes(line[:-1], "big")
                     logger.debug(f"Expecting {self.expected_msg_length} bytes for msg.")
                 except:
                     logger.exception(f"Failed to parse msg length: {line}")
@@ -390,7 +390,7 @@ class MonitorWindow:
         i_wave = np.cos(2 * np.pi * f * t)
         q_wave = np.sin(2 * np.pi * f * t)
         z_wave = np.random.rand(t.size)
-        self.add_wfm(f"test_wfm_random", t, [i_wave, q_wave, z_wave])
+        self.add_wfm("test_wfm_random", t, [i_wave, q_wave, z_wave])
 
 
 class Waveform:
