@@ -160,7 +160,14 @@ class WaveMonitor:
 
         Blocks until server is listening.
         """
-        cmd = ["cmd", "/c", "start", sys.executable, __file__, f"--log={log_level}"]
+        cmd = [
+            "cmd",
+            "/c",
+            "start",
+            sys.executable.replace("pythonw.exe", "python.exe"),
+            __file__,
+            f"--log={log_level}",
+        ]
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = subprocess.SW_HIDE
@@ -509,7 +516,7 @@ class MonitorWindow:
         clear_action.triggered.connect(self.confirm_clear)
         menu.addAction(clear_action)
 
-        sort_action = QAction('Sort list', self.window)
+        sort_action = QAction("Sort list", self.window)
         sort_action.triggered.connect(self.list_widget.sortItems)
         menu.addAction(sort_action)
 
