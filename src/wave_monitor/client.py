@@ -83,7 +83,8 @@ class WaveMonitor:
 
     def write(self, msg: dict) -> None:
         if self.sock.state() != QLocalSocket.ConnectedState:
-            raise RuntimeError("Socket not connected")
+            if not self.refresh_connect():
+                raise RuntimeError("Socket not connected")
 
         self.logger.debug(f"msg to send: {msg}")
 
