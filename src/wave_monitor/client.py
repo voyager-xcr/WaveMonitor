@@ -40,7 +40,7 @@ class WaveMonitor:
                 self.logger.exception("Failed to connect to server.")
 
     def add_line(
-        self, name: str, t: np.ndarray, ys: list[np.ndarray], offset: float
+        self, name: str, ts: np.ndarray, ys: list[np.ndarray], offset: float
     ) -> None:
         # For compatibility, TODO: remove this.
         warnings.warn(
@@ -48,26 +48,36 @@ class WaveMonitor:
             DeprecationWarning,
             stacklevel=2,
         )
-        self.add_wfm(name, t, ys)
+        self.add_wfm(name, ts, ys)
 
-    def add_wfm(self, name: str, t: np.ndarray, ys: list[np.ndarray]) -> None:
+    def add_wfm(
+        self,
+        name: str,
+        ts: list[np.ndarray],
+        ys: list[np.ndarray],
+        sampling_rate: float = 1,
+    ) -> None:
+        if not isinstance(ts, list):
+            ts = [ts]
         if not isinstance(name, str):
             raise TypeError("name must be a string")
-        if not isinstance(t, np.ndarray):
-            raise TypeError("t must be a numpy array")
+        # if not isinstance(t, np.ndarray):
+        #     raise TypeError("t must be a numpy array")
         if not isinstance(ys, list):
             raise TypeError("ys must be a list")
-        if t.ndim != 1:
-            raise ValueError("t must be 1D")
+        # if t.ndim != 1:
+        # raise ValueError("t must be 1D")
         for y in ys:
             if not isinstance(y, np.ndarray):
                 raise TypeError("ys must be a list of numpy arrays")
             if y.ndim != 1:
                 raise ValueError("ys must be a list of 1D numpy arrays")
-            if y.shape != t.shape:
-                raise ValueError("ys must have the same shape as t")
+            # if y.shape != t.shape:
+            #     raise ValueError("ys must have the same shape as t")
 
-        self.write(dict(_type="add_wfm", name=name, t=t, ys=ys))
+        self.write(
+            dict(_type="add_wfm", name=name, ts=ts, ys=ys, sampling_rate=sampling_rate)
+        )
 
     def remove_wfm(self, name: str) -> None:
         if not isinstance(name, str):

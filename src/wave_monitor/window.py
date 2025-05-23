@@ -3,6 +3,7 @@
 import logging
 import sys
 from importlib.resources import files
+from itertools import cycle
 from typing import Callable
 
 import msgpack
@@ -38,13 +39,13 @@ about_message = (
 )
 logger = logging.getLogger(__name__)
 HEAD_LENGTH = 10  # bytes
-N_VISIBLE_WFMS = 100
+N_VISIBLE_WFMS = 10000
 
 
 class DataSource(QLocalServer):
     """Receive messages from client and emit signals to trigger operation on monitor."""
 
-    add_wfm = Signal(str, np.ndarray, list)
+    add_wfm = Signal(str, list, list, float)
     remove_wfm = Signal(str)
     clear = Signal()
     autoscale = Signal()
@@ -117,7 +118,9 @@ class DataSource(QLocalServer):
 
     def emit_signals(self, msg: dict):
         if msg["_type"] == "add_wfm":
-            self.add_wfm.emit(msg["name"], msg["t"], msg["ys"])
+            self.add_wfm.emit(
+                msg["name"], msg["ts"], msg["ys"], msg.get("sampling_rate", 1)
+            )
         elif msg["_type"] == "remove_wfm":
             self.remove_wfm.emit(msg["name"])
         elif msg["_type"] == "clear":
@@ -145,11 +148,11 @@ class MonitorWindow:
 
     logger = logger.getChild("MonitorWindow")
 
-    def __init__(self, wfm_separation: float = 2):
+    def __init__(self, wfm_separation: float = 6):
         MonitorWindow.setup_app_style(QApplication.instance())
         window = QMainWindow()
         window.setWindowTitle("Wave Monitor")
-        window.setWindowIcon(QIcon(str(files("wave_monitor")/"assets"/"icon.png")))
+        window.setWindowIcon(QIcon(str(files("wave_monitor") / "assets" / "icon.png")))
         QShortcut("F", window).activated.connect(self.autoscale)
         QShortcut("C", window).activated.connect(self.confirm_clear)
         QShortcut("R", window).activated.connect(self.refresh_plots)
@@ -233,14 +236,18 @@ class MonitorWindow:
         self.server = server
         self.wfm_separation = wfm_separation
 
-    def add_wfm(self, name: str, t: np.ndarray, ys: list[np.ndarray]):
+    def add_wfm(
+        self, name: str, ts: np.ndarray, ys: list[np.ndarray], sampling_rate: float = 1
+    ):
         if name in self.wfms:
             wfm = self.wfms[name]
-            wfm.update_wfm(t, ys)
+            wfm.update_wfm(ts, ys, sampling_rate)
         else:
             visible_wfms = self.visible_wfms
             offset = self.wfm_separation * len(visible_wfms)
-            wfm = Waveform(name, t, ys, offset, self.plot_item, self.list_widget)
+            wfm = Waveform(
+                name, ts, ys, offset, self.plot_item, self.list_widget, sampling_rate
+            )
             if len(visible_wfms) >= N_VISIBLE_WFMS:
                 wfm.set_visible(False)
             self.wfms[name] = wfm
@@ -373,7 +380,7 @@ class MonitorWindow:
 
     @staticmethod
     def setup_app_style(app: QApplication) -> None:
-        with open(files("wave_monitor")/"assets"/"style.qss", "r") as f:
+        with open(files("wave_monitor") / "assets" / "style.qss", "r") as f:
             _style = f.read()
             app.setStyleSheet(_style)
 
@@ -417,19 +424,47 @@ class Waveform:
     def __init__(
         self,
         name: str,
-        t: np.ndarray,
+        ts: list[np.ndarray],
         ys: list[np.ndarray],
         offset: float,
         plot_item: pg.PlotItem,
         list_widget: QListWidget,
+        sampling_rate: float = 1,
     ):
         """Add line plot to plot_item, add checkbox to list_widget."""
-        lines: list[pg.PlotDataItem] = [
-            plot_item.plot(
-                t, y + offset, pen=color[:-1], fillLevel=offset, fillBrush=color
+        self.sampling_rate = sampling_rate
+        if len(ts) == 1:
+            ts = [ts[0]] * len(ys)
+
+        # lines: list[pg.PlotDataItem] = [
+        #     plot_item.plot(
+        #         t, y + offset, pen=color[:-1], fillLevel=offset, fillBrush=color
+        #     )
+        #     for t, y, color in zip(ts, ys, self.colors)
+        # ]
+        self.t0 = float("inf")
+        self.t1 = float("-inf")
+        colors = cycle(self.colors[:2])
+        lines = []
+        for t, y, color in zip(ts, ys, colors):
+            if isinstance(t, int):
+                # t = np.arange(t, t + len(y))
+                t = np.arange(
+                    t, t + len(y) / self.sampling_rate, 1 / self.sampling_rate
+                )
+            if np.all(y > 0):
+                fillLevel = offset + 1.5
+            elif np.all(y < 0):
+                fillLevel = offset - 1.5
+            else:
+                fillLevel = offset
+            line = plot_item.plot(
+                t, y + offset, pen=color[:-1], fillLevel=fillLevel, fillBrush=color
             )
-            for y, color in zip(ys, self.colors)
-        ]
+
+            self.t0 = min(self.t0, t[0])
+            self.t1 = max(self.t1, t[-1])
+            lines.append(line)
 
         text = pg.TextItem(text=name, anchor=(1, 0.5))
         plot_item.addItem(text)
@@ -444,8 +479,6 @@ class Waveform:
         list_widget.addItem(list_item)
 
         self.offset = offset
-        self.t0 = t[0]
-        self.t1 = t[-1]
         self.plot_item = plot_item
         self.lines = lines
         self.text = text
@@ -453,11 +486,22 @@ class Waveform:
         self.list_item = list_item
         self.list_widget = list_widget
 
-    def update_wfm(self, t: np.ndarray, ys: list[np.ndarray]):
+    def update_wfm(
+        self, ts: list[np.ndarray], ys: list[np.ndarray], sampling_rate: float
+    ):
         # Update existing lines with new data.
         old_lines = self.lines
         new_lines = []
-        for line, y in zip(self.lines, ys):
+        if len(ts) == 1:
+            ts = [ts[0]] * len(ys)
+        self.t0 = float("inf")
+        self.t1 = float("-inf")
+        for line, t, y in zip(self.lines, ts, ys):
+            if isinstance(t, int):
+                # t = np.arange(t, t + len(y))
+                t = np.arange(t, t + len(y) / sampling_rate, 1 / sampling_rate)
+            self.t0 = min(self.t0, t[0])
+            self.t1 = max(self.t1, t[-1])
             line.setData(t, y + self.offset)
             new_lines.append(line)
 
@@ -468,7 +512,11 @@ class Waveform:
 
         # Add more lines if needed.
         if len(ys) > len(old_lines):
-            for y, color in zip(ys[len(old_lines) :], self.colors[len(old_lines) :]):
+            for t, y, color in zip(
+                ts[len(old_lines) :],
+                ys[len(old_lines) :],
+                self.colors[len(old_lines) :],
+            ):
                 line = self.plot_item.plot(
                     t,
                     y + self.offset,
@@ -478,8 +526,6 @@ class Waveform:
                 )
                 new_lines.append(line)
 
-        self.t0 = t[0]
-        self.t1 = t[-1]
         self.lines = new_lines
 
     def update_offset(self, offset: float):
