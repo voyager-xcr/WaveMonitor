@@ -600,3 +600,10 @@ def config_log(dafault_loglevel="INFO"):
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         datefmt="%H:%M:%S",
     )
+
+if __name__ == "__main__":
+    config_log()
+    app = QApplication(sys.argv)
+    _ = MonitorWindow()
+    sys.exit(app.exec())
+
