@@ -35,6 +35,7 @@ class WaveMonitor:
 
     def __init__(self, create_window: bool = True) -> None:
         self.conn: "PipeConnection | None" = None
+        self._last_wfm_time = {}
         if create_window:
             try:
                 self.find_or_create_window()
@@ -64,7 +65,27 @@ class WaveMonitor:
             if y.shape != t.shape:
                 raise ValueError("ys must have the same shape as t")
 
+        now = time.time()
+        server_interval = self.get_wfm_interval()
+        last_time = self._last_wfm_time.get(name, 0)
+        if (now - last_time) < server_interval:
+            self.logger.debug(f"Skipping adding waveform '{name}' due to interval limit.")
+            return None
+        self._last_wfm_time[name] = now
+        self.logger.debug(f"Adding waveform '{name}' with interval {server_interval} seconds.")
         self.write(dict(_type="add_wfm", name=name, t=t, ys=ys))
+
+    def get_wfm_interval(self):
+        try:
+            reply = self.query(dict(_type="get_wfm_interval"))
+            if reply:
+                data = msgpack.unpackb(reply, object_hook=msgpack_numpy.decode)
+                self.logger.debug(f"msg received: {data}")
+                if isinstance(data, dict) and data.get("_type") == "wfm_interval":
+                    return float(data.get("interval", 0.0) or 0.0)
+        except Exception:
+            self.logger.exception("Failed to get waveform interval.")
+        return 0.0
 
     def remove_wfm(self, name: str) -> None:
         if not isinstance(name, str):

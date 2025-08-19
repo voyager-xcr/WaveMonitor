@@ -83,18 +83,17 @@ class DataSource(QThread):
                         self.logger.debug(f"Received {len(msg_data)} bytes.")
 
                         # Process the message
-                        msg = msgpack.unpackb(
-                            msg_data, object_hook=msgpack_numpy.decode
-                        )
+                        msg = msgpack.unpackb(msg_data, object_hook=msgpack_numpy.decode)
                         self.logger.debug(f"Received: {msg}")
                         self.emit_signals(msg)
-
-                except EOFError:
-                    # Client disconnected
-                    self.logger.info("Client disconnected.")
+                except (EOFError, BrokenPipeError, OSError) as e:
+                    # Treat these as an expected disconnect (client closed or
+                    # pipe/handle closed during shutdown).
+                    self.logger.info("Client disconnected: %r", e)
                     self.conn = None
                 except Exception as e:
-                    self.logger.error(f"Error handling message: {e}")
+                    # Unexpected errors should be logged for investigation.
+                    self.logger.exception("Error handling message: %s", e)
                     self.conn = None
 
             # Small delay to prevent busy waiting
@@ -111,6 +110,13 @@ class DataSource(QThread):
             self.autoscale.emit()
         elif msg["_type"] == "add_note":
             self.add_note.emit(msg["name"], msg["note"])
+        elif msg["_type"] == "get_wfm_interval":
+            if self.conn:
+                try:
+                    payload = {"_type": "wfm_interval", "interval": self.parent().wfm_interval}
+                    self.conn.send_bytes(msgpack.packb(payload, default=msgpack_numpy.encode))
+                except Exception:
+                    self.logger.exception("Failed to send wfm_interval reply")
         elif msg["_type"] == "are_you_there":
             if self.conn:
                 self.conn.send_bytes(b"yes")
@@ -118,57 +124,115 @@ class DataSource(QThread):
             raise ValueError(f"Unknown message type: {msg['_type']}")
 
     def close(self):
-        self.running = False
-        self.quit()
-        self.wait()
-        if self.conn:
-            self.conn.close()
-        self.listener.close()
-        self.logger.info('Closing server "%s".', PIPE_NAME)
+
+        # Close the listener so accept() will fail/exit promptly.
+        if getattr(self, "listener", None) is not None:
+            try:
+                self.listener.close()
+            except Exception:
+                self.logger.exception("Error closing listener")
+
+        # Close any existing client connection. Use a local reference to
+        # avoid races with the run loop clearing `self.conn`.
+        conn = self.conn
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                self.logger.exception("Error while closing client connection")
+            finally:
+                # Ensure we clear the shared reference
+                try:
+                    self.conn = None
+                except Exception:
+                    pass
+
+        # Ask the thread to stop. Do not block GUI thread long here.
+        try:
+            self.running = False
+            self.quit()
+        except Exception:
+            self.logger.exception("Error quitting DataSource thread")
+
+        self.logger.info('Requested server shutdown "%s".', PIPE_NAME)
 
 
-class MonitorWindow:
-    """Keep some widgets and plot waveforms with them."""
+class MonitorWindow(QObject):
+    """Keep some widgets and plot waveforms with them.
+
+    This class creates the main window, the dock UI for controlling
+    waveform display, and a background DataSource thread to receive
+    messages from clients.
+    """
 
     logger = logger.getChild("MonitorWindow")
 
     def __init__(self, wfm_separation: float = 2):
+        super().__init__()
         MonitorWindow.setup_app_style(QApplication.instance())
+
+        # Basic state
+        self.wfm_separation = wfm_separation
+        self.wfm_interval = 100
+        self.wfms: dict[str, "Waveform"] = {}
+
+        # Build UI and start server thread
+        self._create_main_window()
+        self._create_dock()
+        self._start_server()
+
+        # Finalize
+        self.window.show()
+        self.logger.info("Ready. Right-click to show menu.")
+
+    def _create_main_window(self) -> None:
+        """Create the main window and plotting widget."""
         window = QMainWindow()
         window.setWindowTitle("Wave Monitor")
         window.setWindowIcon(QIcon(str(files("wave_monitor") / "assets" / "icon.png")))
+
+        # Shortcuts
         QShortcut("F", window).activated.connect(self.autoscale)
         QShortcut("C", window).activated.connect(self.confirm_clear)
         QShortcut("R", window).activated.connect(self.refresh_plots)
         QShortcut("Shift+A", window).activated.connect(self._add_test_wfm)
         QShortcut("Shift+1", window).activated.connect(self._add_test_wfm1)
 
+        # Plot widget
         plot_widget = pg.plot(parent=window)
         window.setCentralWidget(plot_widget)
-
         plot_item = plot_widget.getPlotItem()
         plot_item.showGrid(x=True, y=True)
-        # Make it hold millions of points.
         plot_item.setDownsampling(auto=True, mode="subsample")
         plot_item.setClipToView(True)
         # ClipToView disables plot_item.autoRange, as well as "View all" in right-click menu.
         plot_item.getViewBox().disableAutoRange()
-
-        # Custom context menu.
         plot_item.getViewBox().setMenuEnabled(False)  # Disable the menu by pyqtgraph.
+
+        # Right-click filter
         _filter = RightClickFilter(self.show_context_menu)
         # viewport gets the mouseReleaseEvent, See https://blog.csdn.net/theoryll/article/details/110918779
         plot_widget.viewport().installEventFilter(_filter)
         self._right_click_filter = _filter
 
-        dock_widget = QDockWidget(f"wfms⪅{N_VISIBLE_WFMS}", window)
+        # Store references
+        self.window = window
+        self.plot_widget = plot_widget
+        self.plot_item = plot_item
+
+    def _create_dock(self) -> None:
+        """Create the side dock containing wfms list and controls."""
+        dock_widget = QDockWidget(f"wfms⪅{N_VISIBLE_WFMS}", self.window)
         dock_widget.setFloating(False)
-        window.addDockWidget(Qt.RightDockWidgetArea, dock_widget)
+        self.window.addDockWidget(Qt.RightDockWidgetArea, dock_widget)
+
         font_metrics = dock_widget.fontMetrics()
-        initial_width = font_metrics.horizontalAdvance("X") * 15  # 15 chars wide.
-        window.resizeDocks([dock_widget], [initial_width], Qt.Horizontal)
+        initial_width = font_metrics.horizontalAdvance("X") * 15
+        self.window.resizeDocks([dock_widget], [initial_width], Qt.Horizontal)
 
         dock_layout = QVBoxLayout()
+
+        # List widget for wfms
         list_widget = QListWidget()
         list_widget.setDragDropMode(QListWidget.InternalMove)
         list_widget.setSelectionMode(QListWidget.ExtendedSelection)
@@ -179,12 +243,13 @@ class MonitorWindow:
         self._delete_event_filter = _filter
         dock_layout.addWidget(list_widget)
 
+        # Separation input
         input_layout = QHBoxLayout()
         label = QLabel("sep. ")
         label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         input_layout.addWidget(label)
         wfm_separation_input = QDoubleSpinBox()
-        wfm_separation_input.setValue(wfm_separation)
+        wfm_separation_input.setValue(self.wfm_separation)
         wfm_separation_input.setMinimum(0)
         wfm_separation_input.setSingleStep(0.5)
         wfm_separation_input.setDecimals(1)
@@ -195,32 +260,92 @@ class MonitorWindow:
         input_layout.addWidget(wfm_separation_input)
         dock_layout.addLayout(input_layout)
 
+        # wfm_interval input (seconds)
+        interval_layout = QHBoxLayout()
+        interval_label = QLabel("wfm_interval (s): ")
+        interval_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        interval_layout.addWidget(interval_label)
+        wfm_interval_input = QDoubleSpinBox()
+        wfm_interval_input.setValue(self.wfm_interval)
+        wfm_interval_input.setMinimum(0)
+        wfm_interval_input.setSingleStep(0.1)
+        wfm_interval_input.setDecimals(1)
+        wfm_interval_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        interval_layout.addWidget(wfm_interval_input)
+        dock_layout.addLayout(interval_layout)
+        # when user changes spinbox, update stored value
+        wfm_interval_input.valueChanged.connect(lambda v: setattr(self, "wfm_interval", float(v)))
+
         dock_layout.setSpacing(1)
         dock_layout.setContentsMargins(0, 0, 0, 0)
         input_layout.setSpacing(1)
         input_layout.setContentsMargins(0, 0, 0, 0)
+
         dock_content = QWidget()
         dock_content.setLayout(dock_layout)
         dock_widget.setWidget(dock_content)
 
-        server = DataSource(window)
+        self.dock_widget = dock_widget
+        self.list_widget = list_widget
+
+    def _start_server(self) -> None:
+        """Start the DataSource thread to receive client messages."""
+        server = DataSource(self)
         server.add_wfm.connect(self.add_wfm)
         server.remove_wfm.connect(self.remove_wfm)
         server.clear.connect(self.clear)
         server.autoscale.connect(self.autoscale)
         server.add_note.connect(self.add_note)
         server.start()
-
-        window.show()
-        self.logger.info("Ready. Right-click to show menu.")
-        self.wfms: dict[str, "Waveform"] = {}
-        self.window = window
-        self.plot_widget = plot_widget
-        self.plot_item = plot_item
-        self.dock_widget = dock_widget
-        self.list_widget = list_widget
         self.server = server
-        self.wfm_separation = wfm_separation
+        # Install a close-event filter on the main window to ensure server stops.
+        try:
+            close_filter = WindowCloseFilter(server)
+            self.window.installEventFilter(close_filter)
+            self._window_close_filter = close_filter
+        except Exception:
+            logger.exception("Failed to install WindowCloseFilter")
+        # Also ensure server is closed when the main window is destroyed.
+        try:
+            self.window.destroyed.connect(server.close)
+        except Exception:
+            logger.exception("Failed to connect window.destroyed to server.close")
+
+        # Wrap the main window closeEvent to request server shutdown and wait
+        # a short while for the thread to finish while processing events so
+        # the GUI does not freeze and we avoid destroying a running QThread.
+        try:
+            import time
+
+            original_close = self.window.closeEvent
+
+            def _close_event(ev):
+                try:
+                    if getattr(self, "server", None):
+                        self.server.close()
+                        # wait up to 2 seconds for the thread to stop
+                        deadline = time.time() + 2.0
+                        while self.server.isRunning() and time.time() < deadline:
+                            QApplication.processEvents()
+                            # wait a short time to allow the thread to finish
+                            self.server.wait(50)
+                        # If still running after graceful wait, force terminate as a last resort
+                        if self.server.isRunning():
+                            logger.warning("Server did not stop gracefully; terminating thread")
+                            try:
+                                self.server.terminate()
+                                self.server.wait(500)
+                            except Exception:
+                                logger.exception("Failed to terminate DataSource thread")
+                except Exception:
+                    logger.exception("Error while waiting for server to stop on close")
+                # call original closeEvent
+                return original_close(ev)
+
+            # Bind the wrapper to the window
+            self.window.closeEvent = _close_event
+        except Exception:
+            logger.exception("Failed to install closeEvent wrapper")
 
     def add_wfm(self, name: str, t: np.ndarray, ys: list[np.ndarray]):
         if name in self.wfms:
@@ -569,6 +694,23 @@ class DeleteEventFilter(QObject):
                 self.remove_wfm(item.text())
             return True
         return super().eventFilter(source, event)
+
+
+class WindowCloseFilter(QObject):
+    """Event filter to detect window close and stop the DataSource server."""
+
+    def __init__(self, server: DataSource):
+        super().__init__()
+        self._server = server
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Close:
+            try:
+                # Stop the server thread cleanly when the window is closed.
+                self._server.close()
+            except Exception:
+                logger.exception("Error while stopping DataSource on window close")
+        return super().eventFilter(watched, event)
 
 
 def config_log(dafault_loglevel="INFO"):
