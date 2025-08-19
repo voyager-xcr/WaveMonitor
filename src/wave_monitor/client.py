@@ -2,16 +2,19 @@ import logging
 import subprocess
 import time
 import warnings
-from typing import Literal
+from multiprocessing.connection import Client as MPClient
+from typing import TYPE_CHECKING, Literal
 
 import msgpack
 import msgpack_numpy
 import numpy as np
-from PySide6.QtNetwork import QLocalSocket
+from typing_extensions import deprecated
 
-PIPE_NAME = "wave_monitor"
+if TYPE_CHECKING:
+    from multiprocessing.connection import PipeConnection
+
+PIPE_NAME = "//./pipe/WaveMonitor"
 logger = logging.getLogger(__name__)
-HEAD_LENGTH = 10  # bytes
 
 
 class WaveMonitor:
@@ -31,23 +34,17 @@ class WaveMonitor:
     logger = logger.getChild("WaveMonitor")
 
     def __init__(self, create_window: bool = True) -> None:
-        self.sock = QLocalSocket()
-        self.sock.connectToServer(PIPE_NAME)
+        self.conn: "PipeConnection | None" = None
         if create_window:
             try:
                 self.find_or_create_window()
             except:
                 self.logger.exception("Failed to connect to server.")
 
-    def add_line(
-        self, name: str, t: np.ndarray, ys: list[np.ndarray], offset: float
-    ) -> None:
-        # For compatibility, TODO: remove this.
-        warnings.warn(
-            "Use add_wfm instead. This will be removed by v0.1",
-            DeprecationWarning,
-            stacklevel=2,
-        )
+    @deprecated(
+        "offset will be ignored. Use add_wfm instead. This will be removed by v0.1"
+    )
+    def add_line(self, name: str, t: np.ndarray, ys: list[np.ndarray], offset) -> None:
         self.add_wfm(name, t, ys)
 
     def add_wfm(self, name: str, t: np.ndarray, ys: list[np.ndarray]) -> None:
@@ -90,41 +87,40 @@ class WaveMonitor:
         self.write(dict(_type="add_note", name=name, note=note))
 
     def write(self, msg: dict) -> None:
-        if self.sock.state() != QLocalSocket.ConnectedState:
+        if not self.conn or self.conn.closed:
             if not self.refresh_connect():
                 raise RuntimeError("Socket not connected")
 
         self.logger.debug(f"msg to send: {msg}")
 
         msg = msgpack.packb(msg, default=msgpack_numpy.encode)
-        msg += b"\n"  # Add a newline to indicate the end of message.
-        self.sock.write(len(msg).to_bytes(HEAD_LENGTH - 1, "big") + b"\n")
-        self.sock.waitForBytesWritten()
-        self.sock.write(msg)
+        self.conn.send_bytes(msg)
         self.logger.debug(f"msg sent: {len(msg)} bytes")
 
     def query(self, msg: dict, timeout_ms: int = 1000) -> bytes:
-        # BUG: timeout if too much previous data waitting to send. Maybe flush hleps.
+        # BUG: timeout if too much previous data waitting to send. Maybe flush helps.
         self.write(msg)
-        self.sock.waitForBytesWritten()  # Make sure bytes written.
-        if self.sock.waitForReadyRead(timeout_ms):
-            msg = self.sock.readAll().data().strip()  # Could be empty.
-        else:
-            msg = b""
-        return msg
+        start_time = time.time()
+        while time.time() - start_time < timeout_ms / 1000:
+            if self.conn.poll():
+                msg = self.conn.recv_bytes()
+                return msg
+            time.sleep(0.01)  # 10ms
+        return b""
 
     def disconnect(self) -> None:
-        self.sock.disconnectFromServer()
-        if self.sock.state() == QLocalSocket.ConnectedState:
-            if not self.sock.waitForDisconnected():
-                raise RuntimeError("Could not disconnect from server")
+        if self.conn:
+            self.conn.close()
+            self.conn = None
 
     def refresh_connect(self, timeout_ms: int = 100) -> bool:
         """Connect to server and returns success status."""
         self.disconnect()  # Refresh the state, otherwise the state is still connected.
-        self.sock.connectToServer(PIPE_NAME)
-        result = self.sock.waitForConnected(timeout_ms)
-        return result
+        try:
+            self.conn = MPClient(PIPE_NAME, family="AF_PIPE")
+            return True
+        except:
+            return False
 
     def find_or_create_window(
         self,

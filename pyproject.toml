@@ -34,3 +34,8 @@ packages = ["src/wave_monitor"]
 
 [tool.hatch.version]
 path = "src/wave_monitor/__about__.py"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.12.9",
+]

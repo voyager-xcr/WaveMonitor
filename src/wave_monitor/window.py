@@ -3,15 +3,15 @@
 import logging
 import sys
 from importlib.resources import files
+from multiprocessing.connection import Listener
 from typing import Callable
 
 import msgpack
 import msgpack_numpy
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, Qt, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, Qt, QThread, Signal
 from PySide6.QtGui import QAction, QIcon, QMouseEvent, QShortcut
-from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication,
     QDockWidget,
@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 
 from wave_monitor.__about__ import __version__
 
-PIPE_NAME = "wave_monitor"
+PIPE_NAME = "//./pipe/WaveMonitor"
 about_message = (
     f"<b>Wave Monitor</b> v{__version__}<br><br>"
     "A simple GUI for monitoring waveforms.<br><br>"
@@ -41,7 +41,7 @@ HEAD_LENGTH = 10  # bytes
 N_VISIBLE_WFMS = 100
 
 
-class DataSource(QLocalServer):
+class DataSource(QThread):
     """Receive messages from client and emit signals to trigger operation on monitor."""
 
     add_wfm = Signal(str, np.ndarray, list)
@@ -53,68 +53,52 @@ class DataSource(QLocalServer):
 
     def __init__(self, parent):
         super().__init__(parent=parent)
-        self.partial_msg: bytes = b""
-        self.expected_msg_length: int = None
+        self.conn = None
+        self.running = True
 
-        self.newConnection.connect(self.handle_new_connection)
         QApplication.instance().aboutToQuit.connect(self.close)
 
-        # Remove previous instance. see https://doc.qt.io/qtforpython-6/PySide6/QtNetwork/QLocalServer.html#PySide6.QtNetwork.PySide6.QtNetwork.QLocalServer.removeServer
-        # self.removeServer(PIPE_NAME)  # Remove previous instance.
-        self.listen(PIPE_NAME)
+        # Start listening using multiprocessing.connection
+        self.listener = Listener(PIPE_NAME, family="AF_PIPE")
 
         self.logger.info('Listening on "%s".', PIPE_NAME)
 
-    def handle_new_connection(self):
-        self.close_client_connection()  # Close previous connection.
-        self.client_connection = self.nextPendingConnection()
-        self.client_connection.readyRead.connect(self.assmeble_message)
-        self.client_connection.disconnected.connect(
-            lambda: self.logger.info("Client disconnected.")
-        )
-        self.logger.info("New client connected.")
-
-    def assmeble_message(self):
-        # One readyRead signal may contain multiple messages.
-        while self.client_connection.canReadLine():
-            # Read the msg length.
-            if self.expected_msg_length is None:
-                if self.client_connection.bytesAvailable() < HEAD_LENGTH:
-                    continue
-                line = self.client_connection.read(HEAD_LENGTH).data()
+    def run(self):
+        """Main thread loop to handle connections and messages."""
+        while self.running:
+            # Accept new connection if we don't have one
+            if self.conn is None and self.running:
                 try:
-                    self.expected_msg_length = int.from_bytes(line[:-1], "big")
-                    logger.debug(f"Expecting {self.expected_msg_length} bytes for msg.")
-                except:
-                    logger.exception(f"Failed to parse msg length: {line}")
-                    continue
+                    self.conn = self.listener.accept()
+                    self.logger.info("New client connected.")
+                except OSError:
+                    # No connection available
+                    pass
 
-            # Read the msg.
-            if self.client_connection.bytesAvailable() < self.expected_msg_length:
-                continue
+            # Handle messages from client
+            if self.conn is not None:
+                try:
+                    while self.conn.poll() and self.running:
+                        msg_data = self.conn.recv_bytes()
+                        self.logger.debug(f"Received {len(msg_data)} bytes.")
 
-            msg = self.client_connection.read(self.expected_msg_length).data()
-            logger.debug(f"Received {len(msg)} bytes.")
-            self.partial_msg += msg
-            self.expected_msg_length -= len(msg)
+                        # Process the message
+                        msg = msgpack.unpackb(
+                            msg_data, object_hook=msgpack_numpy.decode
+                        )
+                        self.logger.debug(f"Received: {msg}")
+                        self.emit_signals(msg)
 
-            if len(self.partial_msg) < self.expected_msg_length:
-                self.logger.debug(
-                    "msg len: %s, expected: %s",
-                    len(self.partial_msg),
-                    self.expected_msg_length,
-                )
-                continue
+                except EOFError:
+                    # Client disconnected
+                    self.logger.info("Client disconnected.")
+                    self.conn = None
+                except Exception as e:
+                    self.logger.error(f"Error handling message: {e}")
+                    self.conn = None
 
-            # Process the message
-            msg = msgpack.unpackb(
-                self.partial_msg[:-1], object_hook=msgpack_numpy.decode
-            )
-            self.partial_msg = b""
-            self.expected_msg_length = None
-
-            self.logger.debug(f"Received: {msg}")
-            self.emit_signals(msg)
+            # Small delay to prevent busy waiting
+            self.msleep(10)
 
     def emit_signals(self, msg: dict):
         if msg["_type"] == "add_wfm":
@@ -128,19 +112,19 @@ class DataSource(QLocalServer):
         elif msg["_type"] == "add_note":
             self.add_note.emit(msg["name"], msg["note"])
         elif msg["_type"] == "are_you_there":
-            self.client_connection.write(b"yes")
+            if self.conn:
+                self.conn.send_bytes(b"yes")
         else:
             raise ValueError(f"Unknown message type: {msg['_type']}")
 
-    def close_client_connection(self):
-        if hasattr(self, "client_connection"):
-            self.client_connection.readyRead.disconnect(self.assmeble_message)
-            self.client_connection.close()  # Not working, because client not in qt event loop.
-
     def close(self):
-        self.close_client_connection()
+        self.running = False
+        self.quit()
+        self.wait()
+        if self.conn:
+            self.conn.close()
+        self.listener.close()
         self.logger.info('Closing server "%s".', PIPE_NAME)
-        super().close()
 
 
 class MonitorWindow:
@@ -152,7 +136,7 @@ class MonitorWindow:
         MonitorWindow.setup_app_style(QApplication.instance())
         window = QMainWindow()
         window.setWindowTitle("Wave Monitor")
-        window.setWindowIcon(QIcon(str(files("wave_monitor")/"assets"/"icon.png")))
+        window.setWindowIcon(QIcon(str(files("wave_monitor") / "assets" / "icon.png")))
         QShortcut("F", window).activated.connect(self.autoscale)
         QShortcut("C", window).activated.connect(self.confirm_clear)
         QShortcut("R", window).activated.connect(self.refresh_plots)
@@ -225,6 +209,7 @@ class MonitorWindow:
         server.clear.connect(self.clear)
         server.autoscale.connect(self.autoscale)
         server.add_note.connect(self.add_note)
+        server.start()
 
         window.show()
         self.logger.info("Ready. Right-click to show menu.")
@@ -383,7 +368,7 @@ class MonitorWindow:
 
     @staticmethod
     def setup_app_style(app: QApplication) -> None:
-        with open(files("wave_monitor")/"assets"/"style.qss", "r") as f:
+        with open(files("wave_monitor") / "assets" / "style.qss", "r") as f:
             _style = f.read()
             app.setStyleSheet(_style)
 
@@ -601,9 +586,9 @@ def config_log(dafault_loglevel="INFO"):
         datefmt="%H:%M:%S",
     )
 
+
 if __name__ == "__main__":
     config_log()
     app = QApplication(sys.argv)
     _ = MonitorWindow()
     sys.exit(app.exec())
-
