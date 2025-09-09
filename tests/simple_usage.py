@@ -1,6 +1,8 @@
-from wave_monitor import WaveMonitor
-import numpy as np
 import logging
+
+import numpy as np
+
+from wave_monitor import WaveMonitor
 
 logging.basicConfig(level=logging.DEBUG)
 

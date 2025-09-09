@@ -293,7 +293,7 @@ class MonitorWindow(QObject):
         server = DataSource(self)
         server.add_wfm.connect(self.add_wfm)
         server.remove_wfm.connect(self.remove_wfm)
-        server.clear.connect(self.clear)
+        server.clear.connect(self.client_clear)
         server.autoscale.connect(self.autoscale)
         server.add_note.connect(self.add_note)
         server.start()
@@ -369,6 +369,10 @@ class MonitorWindow(QObject):
     def clear(self):
         for name in list(self.wfms.keys()):
             self.remove_wfm(name)
+
+    def client_clear(self):
+        for wfm in self.wfms.values():
+            wfm.update_wfm(np.array([0,1]), [np.array([0,0])])
 
     def confirm_clear(self):
         """Ask user to confirm before clearing all wfms."""
@@ -730,7 +734,7 @@ def config_log(dafault_loglevel="INFO"):
 
 
 if __name__ == "__main__":
-    config_log()
+    config_log("DEBUG")
     app = QApplication(sys.argv)
     _ = MonitorWindow()
     sys.exit(app.exec())

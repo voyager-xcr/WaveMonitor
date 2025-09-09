@@ -94,6 +94,10 @@ class WaveMonitor:
         self.write(dict(_type="remove_wfm", name=name))
 
     def clear(self) -> None:
+        """Set all waveforms to zero.
+
+        Note: This does not remove the waveforms, right click on the window to remove them.
+        """
         self.write(dict(_type="clear"))
 
     def autoscale(self) -> None:
