@@ -2,18 +2,19 @@ import logging
 import subprocess
 import time
 import warnings
-from multiprocessing.connection import Client as MPClient
 from typing import TYPE_CHECKING, Literal
 
 import msgpack
 import msgpack_numpy
 import numpy as np
+from PySide6.QtNetwork import QLocalSocket
 from typing_extensions import deprecated
 
 if TYPE_CHECKING:
     from multiprocessing.connection import PipeConnection
 
-PIPE_NAME = "//./pipe/WaveMonitor"
+PIPE_NAME = "wave_monitor"
+HEAD_LENGTH = 10  # bytes
 logger = logging.getLogger(__name__)
 
 
@@ -34,7 +35,8 @@ class WaveMonitor:
     logger = logger.getChild("WaveMonitor")
 
     def __init__(self, create_window: bool = True) -> None:
-        self.conn: "PipeConnection | None" = None
+        self.sock = QLocalSocket()
+        self.sock.connectToServer(PIPE_NAME)
         self._last_wfm_time = {}
         if create_window:
             try:
@@ -42,9 +44,7 @@ class WaveMonitor:
             except:
                 self.logger.exception("Failed to connect to server.")
 
-    @deprecated(
-        "offset will be ignored. Use add_wfm instead. This will be removed by v0.1"
-    )
+    @deprecated("offset will be ignored. Use add_wfm instead.")
     def add_line(self, name: str, t: np.ndarray, ys: list[np.ndarray], offset) -> None:
         self.add_wfm(name, t, ys)
 
@@ -76,15 +76,16 @@ class WaveMonitor:
         self.write(dict(_type="add_wfm", name=name, t=t, ys=ys))
 
     def get_wfm_interval(self):
-        try:
-            reply = self.query(dict(_type="get_wfm_interval"))
-            if reply:
-                data = msgpack.unpackb(reply, object_hook=msgpack_numpy.decode)
-                self.logger.debug(f"msg received: {data}")
-                if isinstance(data, dict) and data.get("_type") == "wfm_interval":
-                    return float(data.get("interval", 0.0) or 0.0)
-        except Exception:
-            self.logger.exception("Failed to get waveform interval.")
+        # # BUG: super slow!
+        # try:
+        #     reply = self.query(dict(_type="get_wfm_interval"))
+        #     if reply:
+        #         data = msgpack.unpackb(reply, object_hook=msgpack_numpy.decode)
+        #         self.logger.debug(f"msg received: {data}")
+        #         if isinstance(data, dict) and data.get("_type") == "wfm_interval":
+        #             return float(data.get("interval", 0.0) or 0.0)
+        # except Exception:
+        #     self.logger.exception("Failed to get waveform interval.")
         return 0.0
 
     def remove_wfm(self, name: str) -> None:
@@ -112,40 +113,41 @@ class WaveMonitor:
         self.write(dict(_type="add_note", name=name, note=note))
 
     def write(self, msg: dict) -> None:
-        if not self.conn or self.conn.closed:
+        if self.sock.state() != QLocalSocket.ConnectedState:
             if not self.refresh_connect():
                 raise RuntimeError("Socket not connected")
 
         self.logger.debug(f"msg to send: {msg}")
 
         msg = msgpack.packb(msg, default=msgpack_numpy.encode)
-        self.conn.send_bytes(msg)
+        msg += b"\n"  # Add a newline to indicate the end of message.
+        self.sock.write(len(msg).to_bytes(HEAD_LENGTH - 1, "big") + b"\n")
+        self.sock.waitForBytesWritten()
+        self.sock.write(msg)
         self.logger.debug(f"msg sent: {len(msg)} bytes")
 
     def query(self, msg: dict, timeout_ms: int = 1000) -> bytes:
         # BUG: timeout if too much previous data waitting to send. Maybe flush helps.
         self.write(msg)
-        start_time = time.time()
-        while time.time() - start_time < timeout_ms / 1000:
-            if self.conn.poll():
-                msg = self.conn.recv_bytes()
-                return msg
-            time.sleep(0.01)  # 10ms
-        return b""
+        self.sock.waitForBytesWritten()  # Make sure bytes written.
+        if self.sock.waitForReadyRead(timeout_ms):
+            msg = self.sock.readAll().data().strip()  # Could be empty.
+        else:
+            msg = b""
+        return msg
 
     def disconnect(self) -> None:
-        if self.conn:
-            self.conn.close()
-            self.conn = None
+        self.sock.disconnectFromServer()
+        if self.sock.state() == QLocalSocket.ConnectedState:
+            if not self.sock.waitForDisconnected():
+                raise RuntimeError("Could not disconnect from server")
 
     def refresh_connect(self, timeout_ms: int = 100) -> bool:
         """Connect to server and returns success status."""
         self.disconnect()  # Refresh the state, otherwise the state is still connected.
-        try:
-            self.conn = MPClient(PIPE_NAME, family="AF_PIPE")
-            return True
-        except:
-            return False
+        self.sock.connectToServer(PIPE_NAME)
+        result = self.sock.waitForConnected(timeout_ms)
+        return result
 
     def find_or_create_window(
         self,
