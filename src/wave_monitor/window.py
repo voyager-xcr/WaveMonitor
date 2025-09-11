@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -83,7 +84,7 @@ class DataSource(QLocalServer):
                 data = self.client_connection.read(HEAD_LENGTH).data()
                 try:
                     self.frame_length = int.from_bytes(data, "big")
-                    self.logger.info(f"{self.frame_length=:,}")
+                    self.logger.info("Expecting {:,} bytes.".format(self.frame_length))
                 except Exception:
                     self.frame_length = None
                     self.logger.exception("Failed to parse frame length: %r", data)
@@ -149,7 +150,7 @@ class DataSource(QLocalServer):
         elif msg["_type"] == "are_you_there":
             self.client_connection.write(b"yes")
         else:
-            raise ValueError(f"Unknown message type: {msg['_type']}")
+            self.logger.exception(f"Unknown message type: {msg['_type']}")
 
     def close_client_connection(self):
         if hasattr(self, "client_connection"):
@@ -158,7 +159,7 @@ class DataSource(QLocalServer):
 
     def close(self):
         self.close_client_connection()
-        self.logger.info('Closing server "%s".', PIPE_NAME)
+        self.logger.info('Closing server "%s".', self.fullServerName())
         super().close()
 
 
@@ -183,6 +184,7 @@ class MonitorWindow(QObject):
 
         # Build UI and start server thread
         self._create_main_window()
+        self._create_log_dock()
         self._create_dock()
         self._start_server()
 
@@ -294,6 +296,32 @@ class MonitorWindow(QObject):
         self.dock_widget = dock_widget
         self.list_widget = list_widget
 
+    def _create_log_dock(self) -> None:
+        """Create a dock to show log messages."""
+        log_dock = QDockWidget("Log", self.window)
+        log_dock.setFloating(False)
+        log_view = QPlainTextEdit()
+        log_view.setReadOnly(True)
+        log_view.setMaximumBlockCount(1000)
+        log_content = QWidget()
+        log_layout = QVBoxLayout()
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        log_layout.addWidget(log_view)
+        log_content.setLayout(log_layout)
+        log_dock.setWidget(log_content)
+        self.window.addDockWidget(Qt.BottomDockWidgetArea, log_dock)
+        log_dock.hide()
+        self.log_view = log_view
+        self.log_dock = log_dock
+
+        try:
+            self._log_signal = LogSignal()
+            self._log_signal.log.connect(lambda s: self.log_view.appendPlainText(s))
+            handler = QtHandler(self._log_signal)
+            logger.addHandler(handler)
+        except Exception:
+            logger.exception("Failed to initialize GUI log handler")
+
     def _start_server(self) -> None:
         """Start the DataSource thread to receive client messages."""
         server = DataSource(self)
@@ -382,6 +410,10 @@ class MonitorWindow(QObject):
         if not self.dock_widget.isVisible():
             self.dock_widget.show()
 
+    def restore_log_dock(self):
+        if not self.log_dock.isVisible():
+            self.log_dock.show()
+
     def show_context_menu(self, pos: QPointF):
         menu = QMenu(self.plot_widget)
 
@@ -396,6 +428,10 @@ class MonitorWindow(QObject):
         dock_restore_action = QAction('Restore "wfms" list', self.window)
         dock_restore_action.triggered.connect(self.restore_dock)
         menu.addAction(dock_restore_action)
+
+        log_restore_action = QAction('Restore "log" dock', self.window)
+        log_restore_action.triggered.connect(self.restore_log_dock)
+        menu.addAction(log_restore_action)
 
         # # Not working. But anyway, it is slow.
         # export_action = QAction("PyQtGraph Export (csv slow!)", self.window)
@@ -618,6 +654,32 @@ class Waveform:
 
     def is_visible(self) -> bool:
         return self.text.isVisible()
+    
+
+class LogSignal(QObject):
+    """A small QObject to carry log messages to the GUI thread."""
+
+    log = Signal(str)
+
+
+class QtHandler(logging.Handler):
+    """A logging.Handler that emits records through a LogSignal."""
+
+    def __init__(self, signal: LogSignal):
+        super().__init__()
+        self._signal = signal
+        self.setFormatter(
+            logging.Formatter(
+                "%(asctime)s %(levelname)s %(name)s %(message)s", "%H:%M:%S"
+            )
+        )
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            self._signal.log.emit(msg)
+        except Exception:
+            self.handleError(record)
 
 
 class RightClickFilter(QObject):
@@ -674,11 +736,14 @@ class WindowCloseFilter(QObject):
         return super().eventFilter(watched, event)
 
 
-def config_log(dafault_loglevel="INFO"):
-    # Get the log level from command line arguments, find pattern like "=-log=DEBUG"
+def config_log(default_loglevel: str = "INFO"):
+    # Show all numpy array when printing.
+    np.set_printoptions(precision=2, threshold=4, edgeitems=1, linewidth=500)
+
+    # Get the log level from command line arguments, find pattern like "--log=DEBUG"
     loglevel = next(
         (arg.split("=")[1] for arg in sys.argv if arg.startswith("--log=")),
-        dafault_loglevel,
+        default_loglevel,
     )
     numeric_level = getattr(logging, loglevel.upper(), None)
     if not isinstance(numeric_level, int):
