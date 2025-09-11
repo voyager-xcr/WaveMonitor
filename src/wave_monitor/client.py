@@ -10,8 +10,8 @@ import numpy as np
 from PySide6.QtNetwork import QLocalSocket
 from typing_extensions import deprecated
 
-PIPE_NAME = "wave_monitor"
-HEAD_LENGTH = 10  # bytes
+from .constants import CHUNK_SIZE, HEAD_LENGTH, PIPE_NAME
+
 logger = logging.getLogger(__name__)
 
 
@@ -68,10 +68,15 @@ class WaveMonitor:
         server_interval = self.get_wfm_interval()
         last_time = self._last_wfm_time.get(name, 0)
         if (now - last_time) < server_interval:
-            self.logger.debug("Skipping adding waveform '%s' due to interval limit.", name)
+            self.logger.debug(
+                "Skipping adding waveform '%s' due to interval limit: %.3f seconds.",
+                name,
+                server_interval,
+            )
             return None
         self._last_wfm_time[name] = now
-        self.logger.debug("Adding waveform '%s' with interval %.3f seconds.", name, server_interval)
+
+        self.logger.debug("Adding waveform '%s'", name)
         self.write(dict(_type="add_wfm", name=name, t=t, ys=ys))
 
     def get_wfm_interval(self):
@@ -114,26 +119,51 @@ class WaveMonitor:
     def write(self, msg: dict) -> None:
         if self.sock.state() != QLocalSocket.ConnectedState:
             if not self.refresh_connect():
-                raise RuntimeError("Socket not connected")
+                warnings.warn("Not connected to server.")
+                return
 
         self.logger.debug("msg to send: %r", msg)
 
-        msg = msgpack.packb(msg, default=msgpack_numpy.encode)
-        msg += b"\n"  # Add a newline to indicate the end of message.
-        self.sock.write(len(msg).to_bytes(HEAD_LENGTH - 1, "big") + b"\n")
-        self.sock.waitForBytesWritten()
-        self.sock.write(msg)
-        self.logger.debug("msg sent: %d bytes", len(msg))
+        sock = self.sock
+        payload = msgpack.packb(msg, default=msgpack_numpy.encode)
+        total_length = len(payload)
+        sock.write(total_length.to_bytes(HEAD_LENGTH, "big"))
+        sock.waitForBytesWritten()
+
+        start = 0
+        while start < total_length:
+            end = min(start + CHUNK_SIZE, total_length)
+            chunk = payload[start:end]
+            written_len = sock.write(chunk)
+            if written_len == -1:
+                raise RuntimeError("Failed to write to socket.")
+            sock.waitForBytesWritten()
+            start += written_len
+            self.logger.debug(
+                "Wrote %d bytes, %d bytes remaining.",
+                written_len,
+                total_length - start,
+            )
 
     def query(self, msg: dict, timeout_ms: int = 1000) -> bytes:
-        # BUG: timeout if too much previous data waitting to send. Maybe flush helps.
+        """Send a message and wait for a response.
+
+        Raise TimeoutError if no response within timeout period.
+        """
+        if self.sock.state() != QLocalSocket.ConnectedState:
+            if not self.refresh_connect():
+                warnings.warn("Not connected to server.")
+                return
+
         self.write(msg)
-        self.sock.waitForBytesWritten()  # Make sure bytes written.
+        self.sock.waitForBytesWritten()
+
         if self.sock.waitForReadyRead(timeout_ms):
-            msg = self.sock.readAll().data().strip()  # Could be empty.
+            return self.sock.readAll().data().strip()
         else:
-            msg = b""
-        return msg
+            raise TimeoutError(
+                "No response from server for timeout=%r, msg=%r.", timeout_ms, msg
+            )
 
     def disconnect(self) -> None:
         self.sock.disconnectFromServer()
@@ -154,31 +184,28 @@ class WaveMonitor:
         aviod_multiple: bool = True,
         timeout_s: float = 10,
     ) -> None:
-        """Connect to existing monitor_window or create one in new process.
+        """Connect to existing monitor window
+        or create one in new process.
 
         Blocks until server is listening.
         """
-        # start without blocking
+        # TODO: --log is not implemented
         cmd = ["start-wave-monitor", f"--log={log_level}"]
         if not self.refresh_connect(timeout_ms=100):
             subprocess.Popen(cmd)
         elif aviod_multiple:
-            self.logger.info("Monitor is already running, not starting a new one.")
+            warnings.warn("Monitor is already running, not starting a new one.")
             return
         else:
-            subprocess.Popen(cmd)
             warnings.warn("Monitor is already running, starting a duplicate one.")
+            subprocess.Popen(cmd)
 
         start_time = time.time()
         while not self.refresh_connect(timeout_ms=100):
             self.logger.debug("Waiting for server to start listening.")
             if time.time() - start_time > timeout_s:
-                raise RuntimeError("Timeout waiting for server to start listening.")
+                raise TimeoutError("Timeout waiting for server to start listening.")
             time.sleep(0.1)
 
     def echo(self) -> bytes:
-        """Check if the server is responding, for testing purpose."""
-        reply = self.query(dict(_type="are_you_there"))
-        if reply != b"yes":
-            raise RuntimeError("Server is not responding.")
-        return reply
+        return self.query(dict(_type="are_you_there"))

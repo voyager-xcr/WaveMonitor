@@ -29,16 +29,15 @@ from PySide6.QtWidgets import (
 )
 
 from wave_monitor.__about__ import __version__
+from wave_monitor.constants import CHUNK_SIZE, HEAD_LENGTH, PIPE_NAME
 
-PIPE_NAME = "wave_monitor"
 about_message = (
     f"<b>Wave Monitor</b> v{__version__}<br><br>"
     "A simple GUI for monitoring waveforms.<br><br>"
     "by Jiawei Qiu"
 )
-logger = logging.getLogger(__name__)
-HEAD_LENGTH = 10  # bytes
 N_VISIBLE_WFMS = 100
+logger = logging.getLogger(__name__)
 
 
 class DataSource(QLocalServer):
@@ -53,8 +52,8 @@ class DataSource(QLocalServer):
 
     def __init__(self, parent):
         super().__init__(parent=parent)
-        self.partial_msg: bytes = b""
-        self.expected_msg_length: int = None
+        self.frame_buffer: bytes = b""
+        self.frame_length: int | None = None
 
         self.newConnection.connect(self.handle_new_connection)
         QApplication.instance().aboutToQuit.connect(self.close)
@@ -63,56 +62,67 @@ class DataSource(QLocalServer):
         # self.removeServer(PIPE_NAME)  # Remove previous instance.
         self.listen(PIPE_NAME)
 
-        self.logger.info('Listening on "%s".', PIPE_NAME)
+        self.logger.info('Listening on "%s".', self.fullServerName())
 
     def handle_new_connection(self):
         self.close_client_connection()  # Close previous connection.
         self.client_connection = self.nextPendingConnection()
-        self.client_connection.readyRead.connect(self.assmeble_message)
+        self.client_connection.readyRead.connect(self.read_frame)
         self.client_connection.disconnected.connect(
             lambda: self.logger.info("Client disconnected.")
         )
         self.logger.info("New client connected.")
 
-    def assmeble_message(self):
-        # One readyRead signal may contain multiple messages.
-        while self.client_connection.canReadLine():
-            # Read the msg length.
-            if self.expected_msg_length is None:
+    def read_frame(self):
+        while self.client_connection.bytesAvailable():
+            self.logger.debug(">>> Buffer updated")
+            if self.frame_length is None:
                 if self.client_connection.bytesAvailable() < HEAD_LENGTH:
+                    self.logger.debug("Not enough data to read frame length.")
                     return  # Wait for next buffer update.
-                line = self.client_connection.read(HEAD_LENGTH).data()
-                self.expected_msg_length = int.from_bytes(line[:-1], "big")
-                logger.debug("Expecting %d bytes for msg.", self.expected_msg_length)
+                data = self.client_connection.read(HEAD_LENGTH).data()
+                try:
+                    self.frame_length = int.from_bytes(data, "big")
+                    self.logger.info(f"{self.frame_length=:,}")
+                except Exception:
+                    self.frame_length = None
+                    self.logger.exception("Failed to parse frame length: %r", data)
+                    continue  # Try again.
 
-            # Read the msg.
-            if self.client_connection.bytesAvailable() < self.expected_msg_length:
-                continue
+            expected = min(self.frame_length - len(self.frame_buffer), CHUNK_SIZE)
+            available = self.client_connection.bytesAvailable()
+            if available < expected:
+                self.logger.debug(f"{expected=:,}, {available=:,}")
+                return  # Wait for next buffer update.
 
-            msg = self.client_connection.read(self.expected_msg_length).data()
-            logger.debug("Received %d bytes.", len(msg))
-            self.partial_msg += msg
-            self.expected_msg_length -= len(msg)
+            data = self.client_connection.read(expected).data()
+            self.logger.debug(f"Received {len(data):,} bytes.")
+            self.frame_buffer += data
+    
+            if len(self.frame_buffer) < self.frame_length:
+                continue  # Proceed to read the rest.
 
-            if len(self.partial_msg) < self.expected_msg_length:
-                self.logger.debug(
-                    "msg len: %s, expected: %s",
-                    len(self.partial_msg),
-                    self.expected_msg_length,
-                )
-                continue
+            try:
+                msg = msgpack.unpackb(self.frame_buffer, object_hook=msgpack_numpy.decode)
+            except Exception:
+                msg = None
+                self.logger.exception("Failed to parse msg: %r", self.frame_buffer)
 
-            # Process the message
-            msg = msgpack.unpackb(
-                self.partial_msg[:-1], object_hook=msgpack_numpy.decode
-            )
-            self.partial_msg = b""
-            self.expected_msg_length = None
-
-            self.logger.debug("Received: %r", msg)
+            self.frame_buffer = b""
+            self.frame_length = None
+            self.logger.info("<<< Received: %r", msg)
             self.emit_signals(msg)
 
+            continue  # There might be more data.
+
     def emit_signals(self, msg: dict):
+        if not isinstance(msg, dict):
+            self.logger.warning("Invalid message format: %r", msg)
+            return
+        if "_type" not in msg:
+            self.logger.warning("Message missing _type field: %r", msg)
+            return
+        
         if msg["_type"] == "add_wfm":
             self.add_wfm.emit(msg["name"], msg["t"], msg["ys"])
         elif msg["_type"] == "remove_wfm":
@@ -136,7 +146,7 @@ class DataSource(QLocalServer):
 
     def close_client_connection(self):
         if hasattr(self, "client_connection"):
-            self.client_connection.readyRead.disconnect(self.assmeble_message)
+            self.client_connection.readyRead.disconnect(self.read_frame)
             self.client_connection.close()  # Not working, because client not in qt event loop.
 
     def close(self):
