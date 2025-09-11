@@ -5,8 +5,6 @@ import sys
 from importlib.resources import files
 from typing import Callable
 
-import msgpack
-import msgpack_numpy
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, Qt, Signal
@@ -29,8 +27,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from wave_monitor.__about__ import __version__
-from wave_monitor.constants import CHUNK_SIZE, HEAD_LENGTH, PIPE_NAME
+from .__about__ import __version__
+from .constants import CHUNK_SIZE, HEAD_LENGTH, PIPE_NAME
+from .proto import decode, encode
 
 about_message = (
     f"<b>Wave Monitor</b> v{__version__}<br><br>"
@@ -104,9 +103,7 @@ class DataSource(QLocalServer):
                 continue  # Proceed to read the rest.
 
             try:
-                msg = msgpack.unpackb(
-                    self.frame_buffer, object_hook=msgpack_numpy.decode
-                )
+                msg = decode(self.frame_buffer)
             except Exception:
                 msg = None
                 self.logger.exception("Failed to parse msg: %r", self.frame_buffer)
@@ -142,13 +139,11 @@ class DataSource(QLocalServer):
                     "_type": "wfm_interval",
                     "interval": self.parent().wfm_interval,
                 }
-                self.client_connection.write(
-                    msgpack.packb(payload, default=msgpack_numpy.encode)
-                )
+                self.client_connection.write(encode(payload))
             except Exception:
                 self.logger.exception("Failed to send wfm_interval reply")
         elif msg["_type"] == "are_you_there":
-            self.client_connection.write(b"yes")
+            self.client_connection.write(encode("yes"))
         else:
             self.logger.exception(f"Unknown message type: {msg['_type']}")
 

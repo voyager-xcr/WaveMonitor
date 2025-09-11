@@ -4,13 +4,12 @@ import time
 import warnings
 from typing import Literal
 
-import msgpack
-import msgpack_numpy
 import numpy as np
 from PySide6.QtNetwork import QLocalSocket
 from typing_extensions import deprecated
 
 from .constants import CHUNK_SIZE, HEAD_LENGTH, PIPE_NAME
+from .proto import decode, encode
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +29,15 @@ class WaveMonitor:
     """
 
     logger = logger.getChild("WaveMonitor")
+    WFM_INTERVAL_CACHE_DURATION = 3.0  # seconds
 
     def __init__(self, create_window: bool = True) -> None:
         self.sock = QLocalSocket()
         self.sock.connectToServer(PIPE_NAME)
 
         self._last_wfm_time = {}
+        self._wfm_interval = 0.0
+        self._last_interval_check = 0.0
 
         if create_window:
             try:
@@ -80,17 +82,17 @@ class WaveMonitor:
         self.write(dict(_type="add_wfm", name=name, t=t, ys=ys))
 
     def get_wfm_interval(self):
+        if time.time() - self._last_interval_check < self.WFM_INTERVAL_CACHE_DURATION:
+            return self._wfm_interval
+        
         try:
-            reply = self.query(dict(_type="get_wfm_interval"), timeout_ms=200)
-            if reply:
-                data = msgpack.unpackb(reply, object_hook=msgpack_numpy.decode)
-                self.logger.debug("msg received: %r", data)
-                if isinstance(data, dict) and data.get("_type") == "wfm_interval":
-                    return float(data.get("interval", 0.0) or 0.0)
+            msg = self.query(dict(_type="get_wfm_interval"), timeout_ms=200)
+            self._wfm_interval = float(msg['interval'])
+            self._last_interval_check = time.time()
         except Exception:
             self.logger.debug("get_wfm_interval: query failed or timed out")
 
-        return 0.0
+        return self._wfm_interval
 
     def remove_wfm(self, name: str) -> None:
         if not isinstance(name, str):
@@ -119,13 +121,13 @@ class WaveMonitor:
     def write(self, msg: dict) -> None:
         if self.sock.state() != QLocalSocket.ConnectedState:
             if not self.refresh_connect():
-                warnings.warn("Not connected to server.")
+                warnings.warn("Not connected to server.", stacklevel=2)
                 return
 
         self.logger.debug("msg to send: %r", msg)
 
         sock = self.sock
-        payload = msgpack.packb(msg, default=msgpack_numpy.encode)
+        payload = encode(msg)
         total_length = len(payload)
         sock.write(total_length.to_bytes(HEAD_LENGTH, "big"))
         sock.waitForBytesWritten()
@@ -137,7 +139,7 @@ class WaveMonitor:
             written_len = sock.write(chunk)
             if written_len == -1:
                 raise RuntimeError("Failed to write to socket.")
-            sock.waitForBytesWritten()
+            # sock.waitForBytesWritten()
             start += written_len
             self.logger.debug(
                 "Wrote %d bytes, %d bytes remaining.",
@@ -145,25 +147,29 @@ class WaveMonitor:
                 total_length - start,
             )
 
-    def query(self, msg: dict, timeout_ms: int = 1000) -> bytes:
+    def query(self, msg: dict, timeout_ms: int = 1000):
         """Send a message and wait for a response.
 
         Raise TimeoutError if no response within timeout period.
         """
         if self.sock.state() != QLocalSocket.ConnectedState:
             if not self.refresh_connect():
-                warnings.warn("Not connected to server.")
+                warnings.warn("Not connected to server.", stacklevel=2)
                 return
 
         self.write(msg)
         self.sock.waitForBytesWritten()
 
         if self.sock.waitForReadyRead(timeout_ms):
-            return self.sock.readAll().data().strip()
+            data = self.sock.readAll().data().strip()
         else:
             raise TimeoutError(
                 "No response from server for timeout=%r, msg=%r.", timeout_ms, msg
             )
+
+        msg = decode(data)
+        self.logger.debug("query received: %r", msg)
+        return msg
 
     def disconnect(self) -> None:
         self.sock.disconnectFromServer()

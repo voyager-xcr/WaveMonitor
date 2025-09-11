@@ -38,6 +38,8 @@ path = "src/wave_monitor/__about__.py"
 [dependency-groups]
 dev = [
     "ipykernel>=6.30.1",
+    "jupyter>=1.1.1",
     "pytest>=8.4.2",
     "ruff>=0.12.9",
+    "viztracer>=1.0.4",
 ]

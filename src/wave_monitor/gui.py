@@ -3,7 +3,7 @@ import sys
 
 from PySide6.QtWidgets import QApplication
 
-from wave_monitor import MonitorWindow, config_log
+from . import MonitorWindow, config_log
 
 
 def start():
