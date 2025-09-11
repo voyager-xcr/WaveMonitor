@@ -2,16 +2,13 @@ import logging
 import subprocess
 import time
 import warnings
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import msgpack
 import msgpack_numpy
 import numpy as np
 from PySide6.QtNetwork import QLocalSocket
 from typing_extensions import deprecated
-
-if TYPE_CHECKING:
-    from multiprocessing.connection import PipeConnection
 
 PIPE_NAME = "wave_monitor"
 HEAD_LENGTH = 10  # bytes
@@ -37,11 +34,13 @@ class WaveMonitor:
     def __init__(self, create_window: bool = True) -> None:
         self.sock = QLocalSocket()
         self.sock.connectToServer(PIPE_NAME)
+
         self._last_wfm_time = {}
+
         if create_window:
             try:
                 self.find_or_create_window()
-            except:
+            except Exception:
                 self.logger.exception("Failed to connect to server.")
 
     @deprecated("offset will be ignored. Use add_wfm instead.")
@@ -69,23 +68,23 @@ class WaveMonitor:
         server_interval = self.get_wfm_interval()
         last_time = self._last_wfm_time.get(name, 0)
         if (now - last_time) < server_interval:
-            self.logger.debug(f"Skipping adding waveform '{name}' due to interval limit.")
+            self.logger.debug("Skipping adding waveform '%s' due to interval limit.", name)
             return None
         self._last_wfm_time[name] = now
-        self.logger.debug(f"Adding waveform '{name}' with interval {server_interval} seconds.")
+        self.logger.debug("Adding waveform '%s' with interval %.3f seconds.", name, server_interval)
         self.write(dict(_type="add_wfm", name=name, t=t, ys=ys))
 
     def get_wfm_interval(self):
-        # # BUG: super slow!
-        # try:
-        #     reply = self.query(dict(_type="get_wfm_interval"))
-        #     if reply:
-        #         data = msgpack.unpackb(reply, object_hook=msgpack_numpy.decode)
-        #         self.logger.debug(f"msg received: {data}")
-        #         if isinstance(data, dict) and data.get("_type") == "wfm_interval":
-        #             return float(data.get("interval", 0.0) or 0.0)
-        # except Exception:
-        #     self.logger.exception("Failed to get waveform interval.")
+        try:
+            reply = self.query(dict(_type="get_wfm_interval"), timeout_ms=200)
+            if reply:
+                data = msgpack.unpackb(reply, object_hook=msgpack_numpy.decode)
+                self.logger.debug("msg received: %r", data)
+                if isinstance(data, dict) and data.get("_type") == "wfm_interval":
+                    return float(data.get("interval", 0.0) or 0.0)
+        except Exception:
+            self.logger.debug("get_wfm_interval: query failed or timed out")
+
         return 0.0
 
     def remove_wfm(self, name: str) -> None:
@@ -117,14 +116,14 @@ class WaveMonitor:
             if not self.refresh_connect():
                 raise RuntimeError("Socket not connected")
 
-        self.logger.debug(f"msg to send: {msg}")
+        self.logger.debug("msg to send: %r", msg)
 
         msg = msgpack.packb(msg, default=msgpack_numpy.encode)
         msg += b"\n"  # Add a newline to indicate the end of message.
         self.sock.write(len(msg).to_bytes(HEAD_LENGTH - 1, "big") + b"\n")
         self.sock.waitForBytesWritten()
         self.sock.write(msg)
-        self.logger.debug(f"msg sent: {len(msg)} bytes")
+        self.logger.debug("msg sent: %d bytes", len(msg))
 
     def query(self, msg: dict, timeout_ms: int = 1000) -> bytes:
         # BUG: timeout if too much previous data waitting to send. Maybe flush helps.

@@ -9,9 +9,9 @@ import msgpack
 import msgpack_numpy
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, Qt, QThread, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, Qt, Signal
 from PySide6.QtGui import QAction, QIcon, QMouseEvent, QShortcut
-from PySide6.QtNetwork import QLocalServer, QLocalSocket
+from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
     QApplication,
     QDockWidget,
@@ -80,21 +80,17 @@ class DataSource(QLocalServer):
             # Read the msg length.
             if self.expected_msg_length is None:
                 if self.client_connection.bytesAvailable() < HEAD_LENGTH:
-                    continue
+                    return  # Wait for next buffer update.
                 line = self.client_connection.read(HEAD_LENGTH).data()
-                try:
-                    self.expected_msg_length = int.from_bytes(line[:-1], "big")
-                    logger.debug(f"Expecting {self.expected_msg_length} bytes for msg.")
-                except:
-                    logger.exception(f"Failed to parse msg length: {line}")
-                    continue
+                self.expected_msg_length = int.from_bytes(line[:-1], "big")
+                logger.debug("Expecting %d bytes for msg.", self.expected_msg_length)
 
             # Read the msg.
             if self.client_connection.bytesAvailable() < self.expected_msg_length:
                 continue
 
             msg = self.client_connection.read(self.expected_msg_length).data()
-            logger.debug(f"Received {len(msg)} bytes.")
+            logger.debug("Received %d bytes.", len(msg))
             self.partial_msg += msg
             self.expected_msg_length -= len(msg)
 
@@ -113,7 +109,7 @@ class DataSource(QLocalServer):
             self.partial_msg = b""
             self.expected_msg_length = None
 
-            self.logger.debug(f"Received: {msg}")
+            self.logger.debug("Received: %r", msg)
             self.emit_signals(msg)
 
     def emit_signals(self, msg: dict):
@@ -128,15 +124,13 @@ class DataSource(QLocalServer):
         elif msg["_type"] == "add_note":
             self.add_note.emit(msg["name"], msg["note"])
         elif msg["_type"] == "get_wfm_interval":
-            if self.conn:
-                try:
-                    payload = {"_type": "wfm_interval", "interval": self.parent().wfm_interval}
-                    self.conn.send_bytes(msgpack.packb(payload, default=msgpack_numpy.encode))
-                except Exception:
-                    self.logger.exception("Failed to send wfm_interval reply")
+            try:
+                payload = {"_type": "wfm_interval", "interval": self.parent().wfm_interval}
+                self.client_connection.write(msgpack.packb(payload, default=msgpack_numpy.encode))
+            except Exception:
+                self.logger.exception("Failed to send wfm_interval reply")
         elif msg["_type"] == "are_you_there":
-            if self.conn:
-                self.conn.send_bytes(b"yes")
+            self.client_connection.write(b"yes")
         else:
             raise ValueError(f"Unknown message type: {msg['_type']}")
 
@@ -254,7 +248,7 @@ class MonitorWindow(QObject):
         input_layout.addWidget(wfm_separation_input)
         dock_layout.addLayout(input_layout)
 
-        # wfm_interval input (seconds)
+        # wfm_interval input
         interval_layout = QHBoxLayout()
         interval_label = QLabel("wfm_interval (s): ")
         interval_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
@@ -267,7 +261,6 @@ class MonitorWindow(QObject):
         wfm_interval_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         interval_layout.addWidget(wfm_interval_input)
         dock_layout.addLayout(interval_layout)
-        # when user changes spinbox, update stored value
         wfm_interval_input.valueChanged.connect(lambda v: setattr(self, "wfm_interval", float(v)))
 
         dock_layout.setSpacing(1)
@@ -291,54 +284,6 @@ class MonitorWindow(QObject):
         server.autoscale.connect(self.autoscale)
         server.add_note.connect(self.add_note)
         self.server = server
-        # Install a close-event filter on the main window to ensure server stops.
-        try:
-            close_filter = WindowCloseFilter(server)
-            self.window.installEventFilter(close_filter)
-            self._window_close_filter = close_filter
-        except Exception:
-            logger.exception("Failed to install WindowCloseFilter")
-        # Also ensure server is closed when the main window is destroyed.
-        try:
-            self.window.destroyed.connect(server.close)
-        except Exception:
-            logger.exception("Failed to connect window.destroyed to server.close")
-
-        # Wrap the main window closeEvent to request server shutdown and wait
-        # a short while for the thread to finish while processing events so
-        # the GUI does not freeze and we avoid destroying a running QThread.
-        try:
-            import time
-
-            original_close = self.window.closeEvent
-
-            def _close_event(ev):
-                try:
-                    if getattr(self, "server", None):
-                        self.server.close()
-                        # wait up to 2 seconds for the thread to stop
-                        deadline = time.time() + 2.0
-                        while self.server.isRunning() and time.time() < deadline:
-                            QApplication.processEvents()
-                            # wait a short time to allow the thread to finish
-                            self.server.wait(50)
-                        # If still running after graceful wait, force terminate as a last resort
-                        if self.server.isRunning():
-                            logger.warning("Server did not stop gracefully; terminating thread")
-                            try:
-                                self.server.terminate()
-                                self.server.wait(500)
-                            except Exception:
-                                logger.exception("Failed to terminate DataSource thread")
-                except Exception:
-                    logger.exception("Error while waiting for server to stop on close")
-                # call original closeEvent
-                return original_close(ev)
-
-            # Bind the wrapper to the window
-            self.window.closeEvent = _close_event
-        except Exception:
-            logger.exception("Failed to install closeEvent wrapper")
 
     def add_wfm(self, name: str, t: np.ndarray, ys: list[np.ndarray]):
         if name in self.wfms:
@@ -357,7 +302,7 @@ class MonitorWindow(QObject):
             self.wfms[name].remove()
             del self.wfms[name]
         else:
-            self.logger.warning(f"Waveform {name} not found, nothing removed.")
+            self.logger.warning("Waveform %s not found, nothing removed.", name)
 
     def clear(self):
         for name in list(self.wfms.keys()):
@@ -392,7 +337,7 @@ class MonitorWindow(QObject):
         if name in self.wfms:
             self.wfms[name].note.setHtml(note)
         else:
-            self.logger.warning(f"Waveform {name} not found, note not added.")
+            self.logger.warning("Waveform %s not found, note not added.", name)
 
     def refresh_plots(self):
         for i, wfm in enumerate(self.visible_wfms):

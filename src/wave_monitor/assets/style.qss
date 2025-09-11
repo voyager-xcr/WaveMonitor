@@ -115,6 +115,19 @@ QObject::section {
   color: #eee;
   border-radius: 2px;
 }
+QDoubleSpinBox::up-button {
+	subcontrol-origin: border;
+	subcontrol-position: top right;
+	width: 0px;
+	height: 0px;
+}
+
+QDoubleSpinBox::down-button {
+	subcontrol-origin: border;
+	subcontrol-position: bottom right;
+	width: 0px;
+	height: 0px;
+}
 
 
 /*
