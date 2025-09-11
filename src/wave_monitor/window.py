@@ -114,11 +114,11 @@ class DataSource(QLocalServer):
             self.frame_buffer = b""
             self.frame_length = None
             self.logger.info("<<< Received: %r", msg)
-            self.emit_signals(msg)
+            self.handle_client_message(msg)
 
             continue  # There might be more data.
 
-    def emit_signals(self, msg: dict):
+    def handle_client_message(self, msg: dict):
         if not isinstance(msg, dict):
             self.logger.warning("Invalid message format: %r", msg)
             return
