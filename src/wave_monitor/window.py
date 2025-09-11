@@ -359,7 +359,7 @@ class MonitorWindow(QObject):
             self.logger.warning("Waveform %s not found, note not added.", name)
 
     def refresh_plots(self):
-        for i, wfm in enumerate(self.visible_wfms):
+        for i, wfm in enumerate(self.visible_wfms[::-1]):
             wfm.update_offset(self.wfm_separation * i)
 
     @property
@@ -525,7 +525,7 @@ class Waveform:
         # QListWidgetItem is not a QObject, so it can't emit signals.
         # The checkbox state change is emitted by QListWidget.
         list_widget.itemChanged.connect(self.handel_checkbox_change)
-        list_widget.addItem(list_item)
+        list_widget.insertItem(0, list_item)
 
         self.offset = offset
         self.t0 = t[0]
