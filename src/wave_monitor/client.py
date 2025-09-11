@@ -49,7 +49,13 @@ class WaveMonitor:
     def add_line(self, name: str, t: np.ndarray, ys: list[np.ndarray], offset) -> None:
         self.add_wfm(name, t, ys)
 
-    def add_wfm(self, name: str, t: np.ndarray, ys: list[np.ndarray]) -> None:
+    def add_wfm(
+        self,
+        name: str,
+        t: np.ndarray,
+        ys: list[np.ndarray],
+        dtype: np.float16 | np.float32 | np.float64 | None = np.int16,
+    ) -> None:
         if not isinstance(name, str):
             raise TypeError("name must be a string")
         if not isinstance(t, np.ndarray):
@@ -79,15 +85,18 @@ class WaveMonitor:
         self._last_wfm_time[name] = now
 
         self.logger.debug("Adding waveform '%s'", name)
+        if dtype in (np.float16, np.float32, np.float64):
+            t = t.astype(dtype)
+            ys = [y.astype(dtype) for y in ys]
         self.write(dict(_type="add_wfm", name=name, t=t, ys=ys))
 
     def get_wfm_interval(self):
         if time.time() - self._last_interval_check < self.WFM_INTERVAL_CACHE_DURATION:
             return self._wfm_interval
-        
+
         try:
             msg = self.query(dict(_type="get_wfm_interval"), timeout_ms=200)
-            self._wfm_interval = float(msg['interval'])
+            self._wfm_interval = float(msg["interval"])
             self._last_interval_check = time.time()
         except Exception:
             self.logger.debug("get_wfm_interval: query failed or timed out")
