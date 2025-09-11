@@ -98,12 +98,14 @@ class DataSource(QLocalServer):
             data = self.client_connection.read(expected).data()
             self.logger.debug(f"Received {len(data):,} bytes.")
             self.frame_buffer += data
-    
+
             if len(self.frame_buffer) < self.frame_length:
                 continue  # Proceed to read the rest.
 
             try:
-                msg = msgpack.unpackb(self.frame_buffer, object_hook=msgpack_numpy.decode)
+                msg = msgpack.unpackb(
+                    self.frame_buffer, object_hook=msgpack_numpy.decode
+                )
             except Exception:
                 msg = None
                 self.logger.exception("Failed to parse msg: %r", self.frame_buffer)
@@ -122,7 +124,7 @@ class DataSource(QLocalServer):
         if "_type" not in msg:
             self.logger.warning("Message missing _type field: %r", msg)
             return
-        
+
         if msg["_type"] == "add_wfm":
             self.add_wfm.emit(msg["name"], msg["t"], msg["ys"])
         elif msg["_type"] == "remove_wfm":
@@ -135,8 +137,13 @@ class DataSource(QLocalServer):
             self.add_note.emit(msg["name"], msg["note"])
         elif msg["_type"] == "get_wfm_interval":
             try:
-                payload = {"_type": "wfm_interval", "interval": self.parent().wfm_interval}
-                self.client_connection.write(msgpack.packb(payload, default=msgpack_numpy.encode))
+                payload = {
+                    "_type": "wfm_interval",
+                    "interval": self.parent().wfm_interval,
+                }
+                self.client_connection.write(
+                    msgpack.packb(payload, default=msgpack_numpy.encode)
+                )
             except Exception:
                 self.logger.exception("Failed to send wfm_interval reply")
         elif msg["_type"] == "are_you_there":
@@ -271,7 +278,9 @@ class MonitorWindow(QObject):
         wfm_interval_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         interval_layout.addWidget(wfm_interval_input)
         dock_layout.addLayout(interval_layout)
-        wfm_interval_input.valueChanged.connect(lambda v: setattr(self, "wfm_interval", float(v)))
+        wfm_interval_input.valueChanged.connect(
+            lambda v: setattr(self, "wfm_interval", float(v))
+        )
 
         dock_layout.setSpacing(1)
         dock_layout.setContentsMargins(0, 0, 0, 0)
@@ -320,7 +329,7 @@ class MonitorWindow(QObject):
 
     def client_clear(self):
         for wfm in self.wfms.values():
-            wfm.update_wfm(np.array([0,1]), [np.array([0,0])])
+            wfm.update_wfm(np.array([0, 1]), [np.array([0, 0])])
 
     def confirm_clear(self):
         """Ask user to confirm before clearing all wfms."""
