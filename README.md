@@ -1,27 +1,20 @@
 # Wave Monitor
 
-![snapshot](assets/snapshot.png)
+![snapshot](https://Qiujv.github.io/WaveMonitor/docs/assets/snapshot.png)
 
-A simple GUI for monitoring waveforms. It plots waveforms with PyQtGraph in a separate process. The GUI is built with PySide6.
+A simple GUI for monitoring waveforms. It plots waveforms with PyQtGraph in a separate process.
 
-The `WaveMonitor` class is the main interface. It provides methods for adding and removing waveforms from the plot, clearing the plot, and etc.
+The `WaveMonitor` class is the primary Python API.
 
-In GUI, right click to show the menu. Keyboard shortcuts are also supported.
+In the GUI, right click to show the menu. Keyboard shortcuts are also supported.
 
-# Installation
+## Installation
 
 ```bash
 pip install WaveMonitor
 ```
 
-or install from source.
-
-```bash
-pip install git+https://github.com/Qiujv/WaveMonitor.git
-```
-
-# Usage
-Avoid calling `clear` if you only want to update the plot. It is more efficient to update the plot with `add_wfm`.
+## Usage
 
 ```python
 from wave_monitor import WaveMonitor
@@ -29,7 +22,7 @@ import numpy as np
 
 monitor = WaveMonitor()
 monitor.autoscale()
-# monitor.clear()
+monitor.clear()
 
 t = np.linspace(0, 1, 1_000_001)  # 1m pts ~= 1ms for 1GSa/s.
 n = 20
@@ -41,12 +34,12 @@ for i, (i_wave, q_wave) in enumerate(zip(i_waves, q_waves)):
 monitor.autoscale()
 
 monitor.add_wfm("wave_1", t, [i_waves[-1], q_waves[-1]])  # Replaces previous wfm.
+monitor.add_note("wave_1", "re-writen")
 
 monitor.remove_wfm("wave_10")
-
 ```
 
-# Thanks
+## Thanks
 
 This project is derived from [WaveViewer](https://github.com/kahojyun/wave-viewer).
 
