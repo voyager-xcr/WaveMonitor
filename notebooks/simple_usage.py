@@ -24,5 +24,4 @@ monitor.add_wfm("wave_1", t, [i_waves[-1], q_waves[-1]])  # Replaces previous wf
 monitor.remove_wfm("wave_10")
 # monitor.echo()
 
-# monitor.close()
-# monitor.join(10)
+monitor.close()

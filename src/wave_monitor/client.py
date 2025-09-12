@@ -58,14 +58,10 @@ class _IOWorker(threading.Thread):
         self._tasks.put(("disconnect", {"future": fut}))
         return fut
 
-    def stop(self) -> None:
-        self._stop_event.set()
-        # Add a no-op to unblock queue
+    def stop(self, drain: bool = True) -> None:
         self._tasks.put(("_stop", {}))
-
-    def join(self, timeout: float | None = None) -> None:  # type: ignore[override]
-        """Wait for the worker thread to exit."""
-        super().join(timeout)
+        if not drain:
+            self._stop_event.set()
 
     # Thread run-loop
     def run(self) -> None:
@@ -91,7 +87,6 @@ class _IOWorker(threading.Thread):
                     self._logger.warning("Unknown op: %s", op)
             except Exception as e:
                 self._logger.exception("IO worker op failed: %s", op)
-                # If there's a future attached, surface the error
                 fut = payload.get("future")
                 if isinstance(fut, Future) and not fut.done():
                     fut.set_exception(e)
@@ -196,7 +191,7 @@ class _IOWorker(threading.Thread):
         assert self._sock is not None
         self._sock.waitForBytesWritten()
         if self._sock.waitForReadyRead(timeout_ms):
-            data = self._sock.readAll().data().strip()
+            data = self._sock.readAll().data()
         else:
             if not fut.done():
                 fut.set_exception(TimeoutError(
@@ -229,7 +224,7 @@ class WaveMonitor:
     """
 
     logger = logger.getChild("WaveMonitor")
-    WFM_INTERVAL_CACHE_DURATION = 3.0  # seconds
+    WFM_INTERVAL_CACHE_DURATION = 1.0  # seconds
 
     def __init__(self, create_window: bool = True) -> None:
         # Background I/O worker
@@ -361,27 +356,20 @@ class WaveMonitor:
         if not ok:
             raise RuntimeError("Could not disconnect from server")
 
-    def close(self) -> None:
+    def close(self, drain: bool = True, timeout: float | None = 1.0) -> None:
         """Stop background I/O worker."""
         try:
-            self._io.stop()
+            self._io.stop(drain=drain)
         except Exception:
             pass
         try:
-            self._io.join(timeout=1.0)
+            self._io.join(timeout)
         except Exception:
             pass
 
     def __del__(self) -> None:
         try:
             self.close()
-        except Exception:
-            pass
-
-    def join(self, timeout: float | None = None) -> None:
-        """Convenience wrapper to wait for the I/O worker to terminate."""
-        try:
-            self._io.join(timeout)
         except Exception:
             pass
 
