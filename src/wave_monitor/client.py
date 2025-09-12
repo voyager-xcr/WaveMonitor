@@ -1,27 +1,28 @@
 import logging
+import queue
 import subprocess
+import threading
 import time
 import warnings
+from concurrent.futures import Future
 from typing import Literal
 
-import msgpack
-import msgpack_numpy
 import numpy as np
 from PySide6.QtNetwork import QLocalSocket
+from typing_extensions import deprecated
 
-PIPE_NAME = "wave_monitor"
+from .constants import CHUNK_SIZE, HEAD_LENGTH, PIPE_NAME
+from .proto import decode, encode
+
 logger = logging.getLogger(__name__)
-HEAD_LENGTH = 10  # bytes
 
 
 class WaveMonitor:
     """Wrapper to operate Monitor in a separate process.
 
-    Before using it, start a new monitor window by either of following methods:
-
-    1. Call monitor.find_or_create_window().
-
-    2. Run this script, which blocks the process for app event loop.
+    A monitor window is created by
+    either calling `find_or_create_window()`
+    or run `start-wave-monitor` in a separate process.
 
     Note:
         The wrapper is not intend for Qt application, which means neither event loop,
@@ -29,14 +30,21 @@ class WaveMonitor:
     """
 
     logger = logger.getChild("WaveMonitor")
+    WFM_INTERVAL_CACHE_DURATION = 1.0  # seconds
 
     def __init__(self, create_window: bool = True) -> None:
-        self.sock = QLocalSocket()
-        self.sock.connectToServer(PIPE_NAME)
+        # Background I/O worker
+        self._io = _IOWorker()
+        self._io.start()
+
+        self._last_wfm_time = {}
+        self._wfm_interval = 0.0
+        self._last_interval_check = 0.0
+
         if create_window:
             try:
                 self.find_or_create_window()
-            except:
+            except Exception:
                 self.logger.exception("Failed to connect to server.")
 
     def add_line(
@@ -50,6 +58,10 @@ class WaveMonitor:
         )
         self.add_wfm(name, ts, ys)
 
+    @deprecated("offset will be ignored. Use add_wfm instead.")
+    def add_line(self, name: str, t: np.ndarray, ys: list[np.ndarray], offset) -> None:
+        self.add_wfm(name, t, ys)
+
     def add_wfm(
         self,
         name: str,
@@ -59,6 +71,14 @@ class WaveMonitor:
     ) -> None:
         if not isinstance(ts, list):
             ts = [ts]
+
+    def add_wfm(
+        self,
+        name: str,
+        t: np.ndarray,
+        ys: list[np.ndarray],
+        dtype: np.float32 | None = np.float32,
+    ) -> None:
         if not isinstance(name, str):
             raise TypeError("name must be a string")
         # if not isinstance(t, np.ndarray):
@@ -78,6 +98,36 @@ class WaveMonitor:
         self.write(
             dict(_type="add_wfm", name=name, ts=ts, ys=ys, sampling_rate=sampling_rate)
         )
+        now = time.time()
+        server_interval = self.get_wfm_interval()
+        last_time = self._last_wfm_time.get(name, 0)
+        if (now - last_time) < server_interval:
+            self.logger.debug(
+                "Skipping adding waveform '%s' due to interval limit: %.3f seconds.",
+                name,
+                server_interval,
+            )
+            return None
+        self._last_wfm_time[name] = now
+
+        self.logger.debug("Adding waveform '%s'", name)
+        self.write(dict(_type="add_wfm", name=name, t=t, ys=ys, _dtype=dtype))
+
+    def get_wfm_interval(self):
+        if time.time() - self._last_interval_check < self.WFM_INTERVAL_CACHE_DURATION:
+            return self._wfm_interval
+
+        try:
+            msg = self.query(dict(_type="get_wfm_interval"), timeout_ms=200)
+            # Tests monkeypatch query to return packed bytes; accept both forms
+            if isinstance(msg, (bytes, bytearray)):
+                msg = decode(msg)
+            self._wfm_interval = float(msg["interval"])
+            self._last_interval_check = time.time()
+        except Exception:
+            self.logger.debug("get_wfm_interval: query failed or timed out")
+
+        return self._wfm_interval
 
     def remove_wfm(self, name: str) -> None:
         if not isinstance(name, str):
@@ -86,47 +136,73 @@ class WaveMonitor:
         self.write(dict(_type="remove_wfm", name=name))
 
     def clear(self) -> None:
+        """Set all waveforms to zero.
+
+        Note: This does not remove the waveforms, right click on the window to remove them.
+        """
         self.write(dict(_type="clear"))
 
     def autoscale(self) -> None:
         self.write(dict(_type="autoscale"))
 
+    def add_note(self, name: str, note: str):
+        if not isinstance(name, str):
+            raise TypeError("name must be a string")
+        if not isinstance(note, str):
+            raise TypeError("note must be a string")
+
+        self.write(dict(_type="add_note", name=name, note=note))
+
     def write(self, msg: dict) -> None:
-        if self.sock.state() != QLocalSocket.ConnectedState:
-            if not self.refresh_connect():
-                raise RuntimeError("Socket not connected")
+        """Asynchronously send a message via the background I/O thread.
 
-        self.logger.debug(f"msg to send: {msg}")
+        Returns immediately. Errors (like not connected) will be logged/warned
+        by the background worker.
+        """
+        self._io.submit_write(msg)
 
-        msg = msgpack.packb(msg, default=msgpack_numpy.encode)
-        msg += b"\n"  # Add a newline to indicate the end of message.
-        self.sock.write(len(msg).to_bytes(HEAD_LENGTH - 1, "big") + b"\n")
-        self.sock.waitForBytesWritten()
-        self.sock.write(msg)
-        self.logger.debug(f"msg sent: {len(msg)} bytes")
+    def query(self, msg: dict, timeout_ms: int = 1000):
+        """Send a message and wait for a response (synchronous API).
 
-    def query(self, msg: dict, timeout_ms: int = 1000) -> bytes:
-        # BUG: timeout if too much previous data waitting to send. Maybe flush hleps.
-        self.write(msg)
-        self.sock.waitForBytesWritten()  # Make sure bytes written.
-        if self.sock.waitForReadyRead(timeout_ms):
-            msg = self.sock.readAll().data().strip()  # Could be empty.
-        else:
-            msg = b""
-        return msg
+        This delegates to the background I/O worker so the main thread doesn't
+        block on large writes. Raises TimeoutError on no response.
+        """
+        fut = self._io.submit_query(msg, timeout_ms)
+        try:
+            reply = fut.result(timeout=timeout_ms / 1000 + 1)
+        except Exception as e:
+            # Surface TimeoutError or connection errors
+            raise e
+        self.logger.debug("query received: %r", reply)
+        return reply
 
     def disconnect(self) -> None:
-        self.sock.disconnectFromServer()
-        if self.sock.state() == QLocalSocket.ConnectedState:
-            if not self.sock.waitForDisconnected():
-                raise RuntimeError("Could not disconnect from server")
+        fut = self._io.submit_disconnect()
+        ok = fut.result(timeout=1.0)
+        if not ok:
+            raise RuntimeError("Could not disconnect from server")
 
-    def refresh_connect(self, timeout_ms: int = 100) -> bool:
-        """Connect to server and returns success status."""
-        self.disconnect()  # Refresh the state, otherwise the state is still connected.
-        self.sock.connectToServer(PIPE_NAME)
-        result = self.sock.waitForConnected(timeout_ms)
-        return result
+    def close(self, drain: bool = True, timeout: float | None = 1.0) -> None:
+        """Stop background I/O worker."""
+        try:
+            self._io.stop(drain=drain)
+        except Exception:
+            pass
+        try:
+            self._io.join(timeout)
+        except Exception:
+            pass
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def connect(self, timeout_ms: int = 100) -> bool:
+        """Connect to server via the background worker and return success status."""
+        fut = self._io.submit_connect(timeout_ms)
+        return bool(fut.result(timeout=max(1.0, timeout_ms / 1000 + 0.1)))
 
     def find_or_create_window(
         self,
@@ -134,31 +210,211 @@ class WaveMonitor:
         aviod_multiple: bool = True,
         timeout_s: float = 10,
     ) -> None:
-        """Connect to existing monitor_window or create one in new process.
+        """Connect to existing monitor window
+        or create one in new process.
 
-        Blocks until server is listening.
+        Blocks until connected to server.
         """
-        # start without blocking
         cmd = ["start-wave-monitor", f"--log={log_level}"]
-        if not self.refresh_connect(timeout_ms=100):
+        if not self.connect(timeout_ms=100):
             subprocess.Popen(cmd)
         elif aviod_multiple:
-            self.logger.info("Monitor is already running, not starting a new one.")
+            warnings.warn("Monitor is already running, not starting a new one.")
             return
         else:
-            subprocess.Popen(cmd)
             warnings.warn("Monitor is already running, starting a duplicate one.")
+            subprocess.Popen(cmd)
 
         start_time = time.time()
-        while not self.refresh_connect(timeout_ms=100):
+        while not self.connect(timeout_ms=100):
             self.logger.debug("Waiting for server to start listening.")
             if time.time() - start_time > timeout_s:
-                raise RuntimeError("Timeout waiting for server to start listening.")
+                raise TimeoutError("Timeout waiting for server to start listening.")
             time.sleep(0.1)
 
     def echo(self) -> bytes:
-        """Check if the server is responding, for testing purpose."""
-        reply = self.query(dict(_type="are_you_there"))
-        if reply != b"yes":
-            raise RuntimeError("Server is not responding.")
-        return reply
+        return self.query(dict(_type="are_you_there"))
+
+
+class _IOWorker(threading.Thread):
+    """A background I/O worker that owns the QLocalSocket and performs I/O."""
+
+    logger = logger.getChild("IOWorker")
+
+    def __init__(self):
+        super().__init__(name="WaveMonitorIO", daemon=True)
+        self._tasks: queue.Queue[tuple[str, dict]] = queue.Queue(maxsize=128)
+        self._stop_event = threading.Event()
+        self._sock: QLocalSocket | None = None
+
+    # Public API (thread-safe)
+    def submit_write(self, msg: dict) -> None:
+        self._tasks.put(("write", {"msg": msg}))
+
+    def submit_query(self, msg: dict, timeout_ms: int) -> Future:
+        fut: Future = Future()
+        self._tasks.put(
+            ("query", {"msg": msg, "timeout_ms": timeout_ms, "future": fut})
+        )
+        return fut
+
+    def submit_connect(self, timeout_ms: int) -> Future:
+        fut: Future = Future()
+        self._tasks.put(("connect", {"timeout_ms": timeout_ms, "future": fut}))
+        return fut
+
+    def submit_disconnect(self) -> Future:
+        fut: Future = Future()
+        self._tasks.put(("disconnect", {"future": fut}))
+        return fut
+
+    def stop(self, drain: bool = True) -> None:
+        self._tasks.put(("_stop", {}))
+        if not drain:
+            self._stop_event.set()
+
+    # Thread run-loop
+    def run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                op, payload = self._tasks.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if op == "_stop":
+                break
+
+            try:
+                if op == "write":
+                    self._handle_write(payload["msg"])  # fire-and-forget
+                elif op == "query":
+                    self._handle_query(
+                        payload["msg"], payload["timeout_ms"], payload["future"]
+                    )
+                elif op == "connect":
+                    self._handle_connect(payload["timeout_ms"], payload["future"])
+                elif op == "disconnect":
+                    self._handle_disconnect(payload["future"])
+                else:
+                    self.logger.warning("Unknown op: %s", op)
+            except Exception as e:
+                self.logger.exception("IO worker op failed: %s", op)
+                fut = payload.get("future")
+                if isinstance(fut, Future) and not fut.done():
+                    fut.set_exception(e)
+
+        # Cleanup
+        try:
+            if self._sock is not None:
+                if self._sock.state() == QLocalSocket.ConnectedState:
+                    self._sock.disconnectFromServer()
+                    self._sock.waitForDisconnected()
+        except Exception:
+            pass
+
+    # Internal helpers (run in worker thread)
+    def _ensure_connected(self, timeout_ms: int = 100) -> bool:
+        if self._sock is None:
+            # Create socket in this thread to keep Qt thread affinity consistent
+            self._sock = QLocalSocket()
+        if self._sock.state() == QLocalSocket.ConnectedState:
+            return True
+        # Always disconnect first to refresh state
+        try:
+            self._sock.disconnectFromServer()
+        except Exception:
+            pass
+        self._sock.connectToServer(PIPE_NAME)
+        return bool(self._sock.waitForConnected(timeout_ms))
+
+    def _handle_connect(self, timeout_ms: int, fut: Future) -> None:
+        ok = self._ensure_connected(timeout_ms)
+        if not fut.done():
+            fut.set_result(bool(ok))
+
+    def _handle_disconnect(self, fut: Future) -> None:
+        if self._sock is None:
+            ok = True
+        else:
+            try:
+                self._sock.disconnectFromServer()
+                ok = True
+                if self._sock.state() == QLocalSocket.ConnectedState:
+                    ok = bool(self._sock.waitForDisconnected())
+            except Exception:
+                ok = False
+        if not fut.done():
+            fut.set_result(ok)
+
+    def _write_payload(self, payload: bytes) -> None:
+        assert self._sock is not None
+        total_length = len(payload)
+        self._sock.write(total_length.to_bytes(HEAD_LENGTH, "big"))
+        self._sock.waitForBytesWritten()
+
+        start = 0
+        while start < total_length:
+            end = min(start + CHUNK_SIZE, total_length)
+            chunk = payload[start:end]
+            written_len = self._sock.write(chunk)
+            if written_len == -1:
+                raise RuntimeError("Failed to write to socket.")
+            start += written_len
+            self.logger.debug(
+                "Wrote %d bytes, %d bytes remaining.",
+                written_len,
+                total_length - start,
+            )
+
+    def _handle_write(self, msg: dict) -> None:
+        if not self._ensure_connected(timeout_ms=100):
+            warnings.warn("Not connected to server.", stacklevel=2)
+            return
+
+        try:
+            if msg.get("_type") == "add_wfm":
+                _dtype = msg.pop("_dtype", None)
+                if _dtype is not None:
+                    msg["ys"] = [
+                        y.astype(_dtype) if y.dtype != _dtype else y
+                        for y in msg.get("ys")
+                    ]
+        except Exception:
+            self.logger.exception(
+                "Failed dtype conversion in I/O worker; sending original arrays."
+            )
+
+        self.logger.debug("msg to send (async): %r", msg)
+        payload = encode(msg)
+        self._write_payload(payload)
+
+    def _handle_query(self, msg: dict, timeout_ms: int, fut: Future) -> None:
+        if not self._ensure_connected(timeout_ms=100):
+            warnings.warn("Not connected to server.")
+            if not fut.done():
+                fut.set_exception(ConnectionError("Not connected to server"))
+            return
+
+        self.logger.debug("query send: %r", msg)
+        payload = encode(msg)
+        self._write_payload(payload)
+
+        assert self._sock is not None
+        self._sock.waitForBytesWritten()
+        if self._sock.waitForReadyRead(timeout_ms):
+            data = self._sock.readAll().data()
+        else:
+            if not fut.done():
+                fut.set_exception(
+                    TimeoutError(f"No response from server {timeout_ms=} {msg=}")
+                )
+            return
+
+        try:
+            reply = decode(data)
+        except Exception as e:
+            if not fut.done():
+                fut.set_exception(e)
+            return
+        if not fut.done():
+            fut.set_result(reply)

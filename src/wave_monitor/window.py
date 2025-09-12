@@ -6,13 +6,11 @@ from importlib.resources import files
 from itertools import cycle
 from typing import Callable
 
-import msgpack
-import msgpack_numpy
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, Qt, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, Qt, Signal
 from PySide6.QtGui import QAction, QIcon, QMouseEvent, QShortcut
-from PySide6.QtNetwork import QLocalServer, QLocalSocket
+from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
     QApplication,
     QDockWidget,
@@ -24,19 +22,22 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
-from wave_monitor.__about__ import __version__
+from .__about__ import __version__
+from .constants import CHUNK_SIZE, HEAD_LENGTH, PIPE_NAME
+from .proto import decode, encode
 
-PIPE_NAME = "wave_monitor"
 about_message = (
     f"<b>Wave Monitor</b> v{__version__}<br><br>"
     "A simple GUI for monitoring waveforms.<br><br>"
     "by Jiawei Qiu"
 )
+N_VISIBLE_WFMS = 100
 logger = logging.getLogger(__name__)
 HEAD_LENGTH = 10  # bytes
 N_VISIBLE_WFMS = 10000
@@ -49,12 +50,13 @@ class DataSource(QLocalServer):
     remove_wfm = Signal(str)
     clear = Signal()
     autoscale = Signal()
+    add_note = Signal(str, str)
     logger = logger.getChild("DataSource")
 
     def __init__(self, parent):
         super().__init__(parent=parent)
-        self.partial_msg: bytes = b""
-        self.expected_msg_length: int = None
+        self.frame_buffer: bytes = b""
+        self.frame_length: int | None = None
 
         self.newConnection.connect(self.handle_new_connection)
         QApplication.instance().aboutToQuit.connect(self.close)
@@ -63,60 +65,67 @@ class DataSource(QLocalServer):
         # self.removeServer(PIPE_NAME)  # Remove previous instance.
         self.listen(PIPE_NAME)
 
-        self.logger.info('Listening on "%s".', PIPE_NAME)
+        self.logger.info('Listening on "%s".', self.fullServerName())
 
     def handle_new_connection(self):
         self.close_client_connection()  # Close previous connection.
         self.client_connection = self.nextPendingConnection()
-        self.client_connection.readyRead.connect(self.assmeble_message)
+        self.client_connection.readyRead.connect(self.read_frame)
         self.client_connection.disconnected.connect(
             lambda: self.logger.info("Client disconnected.")
         )
         self.logger.info("New client connected.")
 
-    def assmeble_message(self):
-        # One readyRead signal may contain multiple messages.
-        while self.client_connection.canReadLine():
-            # Read the msg length.
-            if self.expected_msg_length is None:
+    def read_frame(self):
+        while self.client_connection.bytesAvailable():
+            self.logger.debug(">>> Buffer updated")
+            if self.frame_length is None:
                 if self.client_connection.bytesAvailable() < HEAD_LENGTH:
-                    continue
-                line = self.client_connection.read(HEAD_LENGTH).data()
+                    self.logger.debug("Not enough data to read frame length.")
+                    return  # Wait for next buffer update.
+                data = self.client_connection.read(HEAD_LENGTH).data()
                 try:
-                    self.expected_msg_length = int.from_bytes(line[:-1], "big")
-                    logger.debug(f"Expecting {self.expected_msg_length} bytes for msg.")
-                except:
-                    logger.exception(f"Failed to parse msg length: {line}")
-                    continue
+                    self.frame_length = int.from_bytes(data, "big")
+                    self.logger.info("Expecting {:,} bytes.".format(self.frame_length))
+                except Exception:
+                    self.frame_length = None
+                    self.logger.exception("Failed to parse frame length: %r", data)
+                    continue  # Try again.
 
-            # Read the msg.
-            if self.client_connection.bytesAvailable() < self.expected_msg_length:
-                continue
+            expected = min(self.frame_length - len(self.frame_buffer), CHUNK_SIZE)
+            available = self.client_connection.bytesAvailable()
+            if available < expected:
+                self.logger.debug(f"{expected=:,}, {available=:,}")
+                return  # Wait for next buffer update.
 
-            msg = self.client_connection.read(self.expected_msg_length).data()
-            logger.debug(f"Received {len(msg)} bytes.")
-            self.partial_msg += msg
-            self.expected_msg_length -= len(msg)
+            data = self.client_connection.read(expected).data()
+            self.logger.debug(f"Received {len(data):,} bytes.")
+            self.frame_buffer += data
 
-            if len(self.partial_msg) < self.expected_msg_length:
-                self.logger.debug(
-                    "msg len: %s, expected: %s",
-                    len(self.partial_msg),
-                    self.expected_msg_length,
-                )
-                continue
+            if len(self.frame_buffer) < self.frame_length:
+                continue  # Proceed to read the rest.
 
-            # Process the message
-            msg = msgpack.unpackb(
-                self.partial_msg[:-1], object_hook=msgpack_numpy.decode
-            )
-            self.partial_msg = b""
-            self.expected_msg_length = None
+            try:
+                msg = decode(self.frame_buffer)
+            except Exception:
+                msg = None
+                self.logger.exception("Failed to parse msg: %r", self.frame_buffer)
 
-            self.logger.debug(f"Received: {msg}")
-            self.emit_signals(msg)
+            self.frame_buffer = b""
+            self.frame_length = None
+            self.logger.info("<<< Received: %r", msg)
+            self.handle_client_message(msg)
 
-    def emit_signals(self, msg: dict):
+            continue  # There might be more data.
+
+    def handle_client_message(self, msg: dict):
+        if not isinstance(msg, dict):
+            self.logger.warning("Invalid message format: %r", msg)
+            return
+        if "_type" not in msg:
+            self.logger.warning("Message missing _type field: %r", msg)
+            return
+
         if msg["_type"] == "add_wfm":
             self.add_wfm.emit(
                 msg["name"], msg["ts"], msg["ys"], msg.get("sampling_rate", 1)
@@ -127,29 +136,63 @@ class DataSource(QLocalServer):
             self.clear.emit()
         elif msg["_type"] == "autoscale":
             self.autoscale.emit()
+        elif msg["_type"] == "add_note":
+            self.add_note.emit(msg["name"], msg["note"])
+        elif msg["_type"] == "get_wfm_interval":
+            try:
+                payload = {
+                    "_type": "wfm_interval",
+                    "interval": self.parent().wfm_interval,
+                }
+                self.client_connection.write(encode(payload))
+            except Exception:
+                self.logger.exception("Failed to send wfm_interval reply")
         elif msg["_type"] == "are_you_there":
-            self.client_connection.write(b"yes")
+            self.client_connection.write(encode("yes"))
         else:
-            raise ValueError(f"Unknown message type: {msg['_type']}")
+            self.logger.exception(f"Unknown message type: {msg['_type']}")
 
     def close_client_connection(self):
         if hasattr(self, "client_connection"):
-            self.client_connection.readyRead.disconnect(self.assmeble_message)
+            self.client_connection.readyRead.disconnect(self.read_frame)
             self.client_connection.close()  # Not working, because client not in qt event loop.
 
     def close(self):
         self.close_client_connection()
-        self.logger.info('Closing server "%s".', PIPE_NAME)
+        self.logger.info('Closing server "%s".', self.fullServerName())
         super().close()
 
 
-class MonitorWindow:
-    """Keep some widgets and plot waveforms with them."""
+class MonitorWindow(QObject):
+    """Keep some widgets and plot waveforms with them.
+
+    This class creates the main window, the dock UI for controlling
+    waveform display, and a background DataSource thread to receive
+    messages from clients.
+    """
 
     logger = logger.getChild("MonitorWindow")
 
     def __init__(self, wfm_separation: float = 6):
         MonitorWindow.setup_app_style(QApplication.instance())
+
+        # Basic state
+        self.wfm_separation = wfm_separation
+        self.wfm_interval = 0.2
+        self.wfms: dict[str, "Waveform"] = {}
+
+        # Build UI and start server thread
+        self._create_main_window()
+        self._create_log_dock()
+        self._create_dock()
+        self._start_server()
+
+        # Finalize
+        self.window.show()
+        self.logger.info("Ready. Right-click to show menu.")
+
+    def _create_main_window(self) -> None:
+        """Create the main window and plotting widget."""
         window = QMainWindow()
         window.setWindowTitle("Wave Monitor")
         window.setWindowIcon(QIcon(str(files("wave_monitor") / "assets" / "icon.png")))
@@ -159,32 +202,41 @@ class MonitorWindow:
         QShortcut("Shift+A", window).activated.connect(self._add_test_wfm)
         QShortcut("Shift+1", window).activated.connect(self._add_test_wfm1)
 
+        # Plot widget
         plot_widget = pg.plot(parent=window)
         window.setCentralWidget(plot_widget)
-
         plot_item = plot_widget.getPlotItem()
         plot_item.showGrid(x=True, y=True)
-        # Make it hold millions of points.
         plot_item.setDownsampling(auto=True, mode="subsample")
         plot_item.setClipToView(True)
         # ClipToView disables plot_item.autoRange, as well as "View all" in right-click menu.
         plot_item.getViewBox().disableAutoRange()
-
-        # Custom context menu.
         plot_item.getViewBox().setMenuEnabled(False)  # Disable the menu by pyqtgraph.
+
+        # Right-click filter
         _filter = RightClickFilter(self.show_context_menu)
         # viewport gets the mouseReleaseEvent, See https://blog.csdn.net/theoryll/article/details/110918779
         plot_widget.viewport().installEventFilter(_filter)
         self._right_click_filter = _filter
 
-        dock_widget = QDockWidget(f"wfms⪅{N_VISIBLE_WFMS}", window)
+        # Store references
+        self.window = window
+        self.plot_widget = plot_widget
+        self.plot_item = plot_item
+
+    def _create_dock(self) -> None:
+        """Create the side dock containing wfms list and controls."""
+        dock_widget = QDockWidget(f"wfms⪅{N_VISIBLE_WFMS}", self.window)
         dock_widget.setFloating(False)
-        window.addDockWidget(Qt.RightDockWidgetArea, dock_widget)
+        self.window.addDockWidget(Qt.RightDockWidgetArea, dock_widget)
+
         font_metrics = dock_widget.fontMetrics()
-        initial_width = font_metrics.horizontalAdvance("X") * 15  # 15 chars wide.
-        window.resizeDocks([dock_widget], [initial_width], Qt.Horizontal)
+        initial_width = font_metrics.horizontalAdvance("X") * 15
+        self.window.resizeDocks([dock_widget], [initial_width], Qt.Horizontal)
 
         dock_layout = QVBoxLayout()
+
+        # List widget for wfms
         list_widget = QListWidget()
         list_widget.setDragDropMode(QListWidget.InternalMove)
         list_widget.setSelectionMode(QListWidget.ExtendedSelection)
@@ -195,12 +247,13 @@ class MonitorWindow:
         self._delete_event_filter = _filter
         dock_layout.addWidget(list_widget)
 
+        # Separation input
         input_layout = QHBoxLayout()
         label = QLabel("sep. ")
         label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         input_layout.addWidget(label)
         wfm_separation_input = QDoubleSpinBox()
-        wfm_separation_input.setValue(wfm_separation)
+        wfm_separation_input.setValue(self.wfm_separation)
         wfm_separation_input.setMinimum(0)
         wfm_separation_input.setSingleStep(0.5)
         wfm_separation_input.setDecimals(1)
@@ -211,30 +264,70 @@ class MonitorWindow:
         input_layout.addWidget(wfm_separation_input)
         dock_layout.addLayout(input_layout)
 
+        # wfm_interval input
+        interval_layout = QHBoxLayout()
+        interval_label = QLabel("wfm_interval (s): ")
+        interval_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        interval_layout.addWidget(interval_label)
+        wfm_interval_input = QDoubleSpinBox()
+        wfm_interval_input.setValue(self.wfm_interval)
+        wfm_interval_input.setMinimum(0)
+        wfm_interval_input.setSingleStep(0.1)
+        wfm_interval_input.setDecimals(1)
+        wfm_interval_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        interval_layout.addWidget(wfm_interval_input)
+        dock_layout.addLayout(interval_layout)
+        wfm_interval_input.valueChanged.connect(
+            lambda v: setattr(self, "wfm_interval", float(v))
+        )
+
         dock_layout.setSpacing(1)
         dock_layout.setContentsMargins(0, 0, 0, 0)
         input_layout.setSpacing(1)
         input_layout.setContentsMargins(0, 0, 0, 0)
+
         dock_content = QWidget()
         dock_content.setLayout(dock_layout)
         dock_widget.setWidget(dock_content)
 
-        server = DataSource(window)
-        server.add_wfm.connect(self.add_wfm)
-        server.remove_wfm.connect(self.remove_wfm)
-        server.clear.connect(self.clear)
-        server.autoscale.connect(self.autoscale)
-
-        window.show()
-        self.logger.info("Ready. Right-click to show menu.")
-        self.wfms: dict[str, "Waveform"] = {}
-        self.window = window
-        self.plot_widget = plot_widget
-        self.plot_item = plot_item
         self.dock_widget = dock_widget
         self.list_widget = list_widget
+
+    def _create_log_dock(self) -> None:
+        """Create a dock to show log messages."""
+        log_dock = QDockWidget("Log", self.window)
+        log_dock.setFloating(False)
+        log_view = QPlainTextEdit()
+        log_view.setReadOnly(True)
+        log_view.setMaximumBlockCount(1000)
+        log_content = QWidget()
+        log_layout = QVBoxLayout()
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        log_layout.addWidget(log_view)
+        log_content.setLayout(log_layout)
+        log_dock.setWidget(log_content)
+        self.window.addDockWidget(Qt.BottomDockWidgetArea, log_dock)
+        log_dock.hide()
+        self.log_view = log_view
+        self.log_dock = log_dock
+
+        try:
+            self._log_signal = LogSignal()
+            self._log_signal.log.connect(lambda s: self.log_view.appendPlainText(s))
+            handler = QtHandler(self._log_signal)
+            logger.addHandler(handler)
+        except Exception:
+            logger.exception("Failed to initialize GUI log handler")
+
+    def _start_server(self) -> None:
+        """Start the DataSource thread to receive client messages."""
+        server = DataSource(self)
+        server.add_wfm.connect(self.add_wfm)
+        server.remove_wfm.connect(self.remove_wfm)
+        server.clear.connect(self.client_clear)
+        server.autoscale.connect(self.autoscale)
+        server.add_note.connect(self.add_note)
         self.server = server
-        self.wfm_separation = wfm_separation
 
     def add_wfm(
         self, name: str, ts: np.ndarray, ys: list[np.ndarray], sampling_rate: float = 1
@@ -257,11 +350,28 @@ class MonitorWindow:
             self.wfms[name].remove()
             del self.wfms[name]
         else:
-            self.logger.warning(f"Waveform {name} not found, nothing removed.")
+            self.logger.warning("Waveform %s not found, nothing removed.", name)
 
     def clear(self):
         for name in list(self.wfms.keys()):
             self.remove_wfm(name)
+
+    def client_clear(self):
+        for wfm in self.wfms.values():
+            wfm.update_wfm(
+                np.array(
+                    [
+                        0,
+                    ]
+                ),
+                [
+                    np.array(
+                        [
+                            0,
+                        ]
+                    )
+                ],
+            )
 
     def confirm_clear(self):
         """Ask user to confirm before clearing all wfms."""
@@ -284,8 +394,14 @@ class MonitorWindow:
             y1 = max(wfm.offset for wfm in visible_wfms) + self.wfm_separation / 2
             self.plot_item.setRange(xRange=(t0, t1), yRange=(y0, y1))
 
+    def add_note(self, name: str, note: str):
+        if name in self.wfms:
+            self.wfms[name].note.setHtml(note)
+        else:
+            self.logger.warning("Waveform %s not found, note not added.", name)
+
     def refresh_plots(self):
-        for i, wfm in enumerate(self.visible_wfms):
+        for i, wfm in enumerate(self.visible_wfms[::-1]):
             wfm.update_offset(self.wfm_separation * i)
 
     @property
@@ -308,6 +424,10 @@ class MonitorWindow:
         if not self.dock_widget.isVisible():
             self.dock_widget.show()
 
+    def restore_log_dock(self):
+        if not self.log_dock.isVisible():
+            self.log_dock.show()
+
     def show_context_menu(self, pos: QPointF):
         menu = QMenu(self.plot_widget)
 
@@ -322,6 +442,10 @@ class MonitorWindow:
         dock_restore_action = QAction('Restore "wfms" list', self.window)
         dock_restore_action.triggered.connect(self.restore_dock)
         menu.addAction(dock_restore_action)
+
+        log_restore_action = QAction('Restore "log" dock', self.window)
+        log_restore_action.triggered.connect(self.restore_log_dock)
+        menu.addAction(log_restore_action)
 
         # # Not working. But anyway, it is slow.
         # export_action = QAction("PyQtGraph Export (csv slow!)", self.window)
@@ -429,6 +553,7 @@ class Waveform:
         offset: float,
         plot_item: pg.PlotItem,
         list_widget: QListWidget,
+        note: str = "",
         sampling_rate: float = 1,
     ):
         """Add line plot to plot_item, add checkbox to list_widget."""
@@ -467,7 +592,9 @@ class Waveform:
             lines.append(line)
 
         text = pg.TextItem(text=name, anchor=(1, 0.5))
+        note = pg.TextItem(text=note, anchor=(0, 0.5))
         plot_item.addItem(text)
+        plot_item.addItem(note)
         plot_item.sigXRangeChanged.connect(self.update_label_pos)
 
         list_item = QListWidgetItem(name)
@@ -476,12 +603,13 @@ class Waveform:
         # QListWidgetItem is not a QObject, so it can't emit signals.
         # The checkbox state change is emitted by QListWidget.
         list_widget.itemChanged.connect(self.handel_checkbox_change)
-        list_widget.addItem(list_item)
+        list_widget.insertItem(0, list_item)
 
         self.offset = offset
         self.plot_item = plot_item
         self.lines = lines
         self.text = text
+        self.note = note
         self.update_label_pos()
         self.list_item = list_item
         self.list_widget = list_widget
@@ -543,6 +671,7 @@ class Waveform:
             self.plot_item.removeItem(line)
 
         self.plot_item.removeItem(self.text)
+        self.plot_item.removeItem(self.note)
         self.plot_item.sigXRangeChanged.disconnect(self.update_label_pos)
 
         row = self.list_widget.row(self.list_item)
@@ -552,17 +681,19 @@ class Waveform:
         viewbox = self.plot_item.getViewBox()
         (x0, x1), (y0, y1) = viewbox.viewRange()
         if x1 <= self.t0:
-            pos = self.t0
+            x = self.t0
         elif x1 <= self.t1:
-            pos = x1
+            x = x1
         else:
-            pos = self.t1
-        self.text.setPos(pos, self.offset)
+            x = self.t1
+        self.text.setPos(x, self.offset)
+        self.note.setPos(x, self.offset)
 
     def set_visible(self, visible: bool):
         for line in self.lines:
             line.setVisible(visible)
         self.text.setVisible(visible)
+        self.note.setVisible(visible)
 
         # Change checkbox state without triggering handel_checkbox_change.
         self.list_widget.itemChanged.disconnect(self.handel_checkbox_change)
@@ -576,6 +707,32 @@ class Waveform:
 
     def is_visible(self) -> bool:
         return self.text.isVisible()
+
+
+class LogSignal(QObject):
+    """A small QObject to carry log messages to the GUI thread."""
+
+    log = Signal(str)
+
+
+class QtHandler(logging.Handler):
+    """A logging.Handler that emits records through a LogSignal."""
+
+    def __init__(self, signal: LogSignal):
+        super().__init__()
+        self._signal = signal
+        self.setFormatter(
+            logging.Formatter(
+                "%(asctime)s %(levelname)s %(name)s %(message)s", "%H:%M:%S"
+            )
+        )
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            self._signal.log.emit(msg)
+        except Exception:
+            self.handleError(record)
 
 
 class RightClickFilter(QObject):
@@ -615,11 +772,31 @@ class DeleteEventFilter(QObject):
         return super().eventFilter(source, event)
 
 
-def config_log(dafault_loglevel="INFO"):
-    # Get the log level from command line arguments, find pattern like "=-log=DEBUG"
+class WindowCloseFilter(QObject):
+    """Event filter to detect window close and stop the DataSource server."""
+
+    def __init__(self, server: DataSource):
+        super().__init__()
+        self._server = server
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Close:
+            try:
+                # Stop the server thread cleanly when the window is closed.
+                self._server.close()
+            except Exception:
+                logger.exception("Error while stopping DataSource on window close")
+        return super().eventFilter(watched, event)
+
+
+def config_log(default_loglevel: str = "INFO"):
+    # Show all numpy array when printing.
+    np.set_printoptions(precision=2, threshold=4, edgeitems=1, linewidth=500)
+
+    # Get the log level from command line arguments, find pattern like "--log=DEBUG"
     loglevel = next(
         (arg.split("=")[1] for arg in sys.argv if arg.startswith("--log=")),
-        dafault_loglevel,
+        default_loglevel,
     )
     numeric_level = getattr(logging, loglevel.upper(), None)
     if not isinstance(numeric_level, int):
@@ -629,3 +806,10 @@ def config_log(dafault_loglevel="INFO"):
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         datefmt="%H:%M:%S",
     )
+
+
+if __name__ == "__main__":
+    config_log("DEBUG")
+    app = QApplication(sys.argv)
+    _ = MonitorWindow()
+    sys.exit(app.exec())

@@ -1,11 +1,12 @@
-from wave_monitor import WaveMonitor
-import numpy as np
 import logging
+
+import numpy as np
+
+from wave_monitor import WaveMonitor
 
 logging.basicConfig(level=logging.DEBUG)
 
 monitor = WaveMonitor()
-monitor.autoscale()
 # monitor.clear()
 
 t = np.linspace(0, 1, 1_001)  # 1m pts ~= 1ms for 1GSa/s.
@@ -21,7 +22,12 @@ for i, (i_wave, q_wave) in enumerate(zip(i_waves, q_waves)):
     )
 monitor.autoscale()
 
-monitor.add_wfm("wave_1", t, [i_waves[-1], q_waves[-1]])  # Replaces previous wfm.
+monitor.add_wfm(
+    "wave_1", t, [i_waves[-1], q_waves[-1], i_waves[0]]
+)  # Replaces previous wfm.
+monitor.add_note("wave_1", "re-writen")
 
 monitor.remove_wfm("wave_10")
 # monitor.echo()
+
+monitor.close()
