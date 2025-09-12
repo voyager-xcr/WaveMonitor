@@ -174,7 +174,7 @@ class MonitorWindow(QObject):
 
         # Basic state
         self.wfm_separation = wfm_separation
-        self.wfm_interval = 0
+        self.wfm_interval = 0.2
         self.wfms: dict[str, "Waveform"] = {}
 
         # Build UI and start server thread
@@ -352,7 +352,7 @@ class MonitorWindow(QObject):
 
     def client_clear(self):
         for wfm in self.wfms.values():
-            wfm.update_wfm(np.array([0, 1]), [np.array([0, 0])])
+            wfm.update_wfm(np.array([0,]), [np.array([0,])])
 
     def confirm_clear(self):
         """Ask user to confirm before clearing all wfms."""
@@ -583,7 +583,7 @@ class Waveform:
                 self.plot_item.removeItem(line)
 
         # Add more lines if needed.
-        if len(ys) > len(old_lines):
+        elif len(ys) > len(old_lines):
             for y, color in zip(ys[len(old_lines) :], self.colors[len(old_lines) :]):
                 line = self.plot_item.plot(
                     t,
@@ -623,13 +623,13 @@ class Waveform:
         viewbox = self.plot_item.getViewBox()
         (x0, x1), (y0, y1) = viewbox.viewRange()
         if x1 <= self.t0:
-            pos = self.t0
+            x = self.t0
         elif x1 <= self.t1:
-            pos = x1
+            x = x1
         else:
-            pos = self.t1
-        self.text.setPos(pos, self.offset)
-        self.note.setPos(pos, self.offset)
+            x = self.t1
+        self.text.setPos(x, self.offset)
+        self.note.setPos(x, self.offset)
 
     def set_visible(self, visible: bool):
         for line in self.lines:
