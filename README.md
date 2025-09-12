@@ -1,12 +1,14 @@
 # Wave Monitor
 
-![snapshot](https://Qiujv.github.io/WaveMonitor/docs/assets/snapshot.png)
+![snapshot](https://qiujv.github.io/WaveMonitor/assets/snapshot.png)
 
 A simple GUI for monitoring waveforms. It plots waveforms with PyQtGraph in a separate process.
 
 The `WaveMonitor` class is the primary Python API.
 
 In the GUI, right click to show the menu. Keyboard shortcuts are also supported.
+
+Also see the [docs](https://qiujv.github.io/WaveMonitor/)
 
 ## Installation
 
