@@ -1,4 +1,5 @@
 import logging
+import multiprocessing.shared_memory as shared_memory
 import queue
 import subprocess
 import threading
@@ -11,7 +12,7 @@ import numpy as np
 from PySide6.QtNetwork import QLocalSocket
 from typing_extensions import deprecated
 
-from .constants import CHUNK_SIZE, HEAD_LENGTH, PIPE_NAME
+from .constants import CHUNK_SIZE, HEAD_LENGTH, PIPE_NAME, SHARED_MEMORY_NAME
 from .proto import decode, encode
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,6 @@ class WaveMonitor:
     """
 
     logger = logger.getChild("WaveMonitor")
-    WFM_INTERVAL_CACHE_DURATION = 1.0  # seconds
 
     def __init__(self, create_window: bool = True) -> None:
         # Background I/O worker
@@ -38,8 +38,7 @@ class WaveMonitor:
         self._io.start()
 
         self._last_wfm_time = {}
-        self._wfm_interval = 0.0
-        self._last_interval_check = 0.0
+        self._shared_memory = None  # Will be initialized when needed
 
         if create_window:
             try:
@@ -78,7 +77,7 @@ class WaveMonitor:
         server_interval = self.get_wfm_interval()
         last_time = self._last_wfm_time.get(name, 0)
         if (now - last_time) < server_interval:
-            self.logger.debug(
+            self.logger.info(
                 "Skipping adding waveform '%s' due to interval limit: %.3f seconds.",
                 name,
                 server_interval,
@@ -89,21 +88,19 @@ class WaveMonitor:
         self.logger.debug("Adding waveform '%s'", name)
         self.write(dict(_type="add_wfm", name=name, t=t, ys=ys, _dtype=dtype))
 
-    def get_wfm_interval(self):
-        if time.time() - self._last_interval_check < self.WFM_INTERVAL_CACHE_DURATION:
-            return self._wfm_interval
-
+    def get_wfm_interval(self) -> float:
         try:
-            msg = self.query(dict(_type="get_wfm_interval"), timeout_ms=200)
-            # Tests monkeypatch query to return packed bytes; accept both forms
-            if isinstance(msg, (bytes, bytearray)):
-                msg = decode(msg)
-            self._wfm_interval = float(msg["interval"])
-            self._last_interval_check = time.time()
-        except Exception:
-            self.logger.debug("get_wfm_interval: query failed or timed out")
+            if self._shared_memory is None:
+                self._shared_memory = shared_memory.ShareableList(
+                    name=SHARED_MEMORY_NAME
+                )
 
-        return self._wfm_interval
+            return float(self._shared_memory[0])
+        except Exception:
+            self.logger.exception(
+                "Failed to read wfm_interval from server, using fallback"
+            )
+            return 0.0
 
     def remove_wfm(self, name: str) -> None:
         if not isinstance(name, str):
@@ -168,6 +165,13 @@ class WaveMonitor:
             self._io.join(timeout)
         except Exception:
             pass
+        # Clean up shared memory connection (don't unlink, server owns it)
+        if self._shared_memory is not None:
+            try:
+                self._shared_memory.shm.close()
+                self._shared_memory = None
+            except Exception:
+                pass
 
     def __del__(self) -> None:
         try:

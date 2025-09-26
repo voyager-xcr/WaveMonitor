@@ -1,7 +1,5 @@
 import warnings
 
-import msgpack
-import msgpack_numpy
 import numpy as np
 import pytest
 
@@ -63,16 +61,50 @@ def test_add_line_delegates_to_add_wfm(monkeypatch):
     np.testing.assert_array_equal(called['args'][2][0], ys[0])
 
 
-def test_get_wfm_interval_parses_reply(monkeypatch):
-    wm = WaveMonitor(create_window=False)
+def test_get_wfm_interval_from_shared_memory(monkeypatch):
+    """Test that get_wfm_interval reads from shared memory"""
+    import multiprocessing.shared_memory as shared_memory
 
-    payload = {"_type": "wfm_interval", "interval": 1.23}
-    packed = msgpack.packb(payload, default=msgpack_numpy.encode)
+    from wave_monitor.constants import SHARED_MEMORY_NAME
+    
+    # Create a test shared memory
+    test_interval = 2.5
+    wm = None
+    shm = None
+    try:
+        # Clean up any existing shared memory
+        try:
+            old_shm = shared_memory.ShareableList(name=SHARED_MEMORY_NAME)
+            old_shm.shm.close()
+            old_shm.shm.unlink()
+        except FileNotFoundError:
+            pass
 
-    def fake_query(msg, timeout_ms=200):
-        return packed
+        # Create new shared memory with test value
+        shm = shared_memory.ShareableList([test_interval], name=SHARED_MEMORY_NAME)
 
-    monkeypatch.setattr(wm, "query", fake_query)
-    res = wm.get_wfm_interval()
-    assert isinstance(res, float)
-    assert abs(res - 1.23) < 1e-6
+        # Test client reading from shared memory
+        wm = WaveMonitor(create_window=False)
+        res = wm.get_wfm_interval()
+
+        assert isinstance(res, float)
+        assert abs(res - test_interval) < 1e-6
+
+        # Test fallback when shared memory is not available
+        wm._shared_memory = None
+        shm.shm.close()
+        shm.shm.unlink()
+
+        # Should return default fallback value (client fallback is 0.0 when shared memory not available)
+        res = wm.get_wfm_interval()
+        assert isinstance(res, float)
+        assert res == 0.0
+    finally:
+        if wm is not None:
+            wm.close()
+        if shm is not None:
+            try:
+                shm.shm.close()
+                shm.shm.unlink()
+            except Exception:
+                pass

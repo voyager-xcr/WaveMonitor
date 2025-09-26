@@ -3,6 +3,7 @@
 import logging
 import sys
 from importlib.resources import files
+from multiprocessing import shared_memory
 from typing import Callable
 
 import numpy as np
@@ -28,7 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from .__about__ import __version__
-from .constants import CHUNK_SIZE, HEAD_LENGTH, PIPE_NAME
+from .constants import CHUNK_SIZE, HEAD_LENGTH, PIPE_NAME, SHARED_MEMORY_NAME
 from .proto import decode, encode
 
 about_message = (
@@ -133,15 +134,6 @@ class DataSource(QLocalServer):
             self.autoscale.emit()
         elif msg["_type"] == "add_note":
             self.add_note.emit(msg["name"], msg["note"])
-        elif msg["_type"] == "get_wfm_interval":
-            try:
-                payload = {
-                    "_type": "wfm_interval",
-                    "interval": self.parent().wfm_interval,
-                }
-                self.client_connection.write(encode(payload))
-            except Exception:
-                self.logger.exception("Failed to send wfm_interval reply")
         elif msg["_type"] == "are_you_there":
             self.client_connection.write(encode("yes"))
         else:
@@ -156,6 +148,58 @@ class DataSource(QLocalServer):
         self.close_client_connection()
         self.logger.info('Closing server "%s".', self.fullServerName())
         super().close()
+
+
+class SharedServerState:
+    """Server state in shared memory."""
+    DEFAULT_WFM_INTERVAL = 0.2  # seconds
+
+    def __init__(self):
+        self._shared_memory = None
+        self.create_shared_memory()
+        QApplication.instance().aboutToQuit.connect(self.cleanup_shared_memory)
+
+    def create_shared_memory(self):
+        try:
+            old_shm = shared_memory.ShareableList(name=SHARED_MEMORY_NAME)
+            self._shared_memory = old_shm
+            logger.info(f"Reused existing shared memory '{SHARED_MEMORY_NAME}'")
+        except FileNotFoundError:
+            pass  # No existing shared memory.
+
+        try:
+            self._shared_memory = shared_memory.ShareableList(
+                [self.DEFAULT_WFM_INTERVAL], name=SHARED_MEMORY_NAME
+            )
+            logger.info(f"Created shared memory '{SHARED_MEMORY_NAME}'")
+        except Exception:
+            logger.exception("Failed to create shared memory")
+
+    def cleanup_shared_memory(self):
+        if self._shared_memory is not None:
+            try:
+                self._shared_memory.shm.close()
+                self._shared_memory.shm.unlink()
+                logger.info("Cleaned up shared memory")
+            except Exception:
+                logger.exception("Error cleaning up shared memory")
+
+    @property
+    def wfm_interval(self) -> float:
+        if self._shared_memory is not None:
+            try:
+                return float(self._shared_memory[0])
+            except Exception:
+                logger.exception("Failed to read wfm_interval from shared memory")
+        return self.DEFAULT_WFM_INTERVAL
+
+    @wfm_interval.setter
+    def wfm_interval(self, value: float) -> None:
+        if self._shared_memory is not None:
+            try:
+                self._shared_memory[0] = value
+            except Exception:
+                logger.exception("Failed to write wfm_interval to shared memory")
 
 
 class MonitorWindow(QObject):
@@ -174,8 +218,8 @@ class MonitorWindow(QObject):
 
         # Basic state
         self.wfm_separation = wfm_separation
-        self.wfm_interval = 0.2
         self.wfms: dict[str, "Waveform"] = {}
+        self.state = SharedServerState()
 
         # Build UI and start server thread
         self._create_main_window()
@@ -268,7 +312,7 @@ class MonitorWindow(QObject):
         interval_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         interval_layout.addWidget(interval_label)
         wfm_interval_input = QDoubleSpinBox()
-        wfm_interval_input.setValue(self.wfm_interval)
+        wfm_interval_input.setValue(self.state.wfm_interval)
         wfm_interval_input.setMinimum(0)
         wfm_interval_input.setSingleStep(0.1)
         wfm_interval_input.setDecimals(1)
@@ -276,7 +320,7 @@ class MonitorWindow(QObject):
         interval_layout.addWidget(wfm_interval_input)
         dock_layout.addLayout(interval_layout)
         wfm_interval_input.valueChanged.connect(
-            lambda v: setattr(self, "wfm_interval", float(v))
+            lambda v: setattr(self.state, "wfm_interval", v)
         )
 
         dock_layout.setSpacing(1)
@@ -352,7 +396,7 @@ class MonitorWindow(QObject):
 
     def client_clear(self):
         for wfm in self.wfms.values():
-            wfm.update_wfm(np.array([0,]), [np.array([0,])])
+            wfm.update_wfm(np.array([0]), [np.array([0])])
 
     def confirm_clear(self):
         """Ask user to confirm before clearing all wfms."""
@@ -649,7 +693,7 @@ class Waveform:
 
     def is_visible(self) -> bool:
         return self.text.isVisible()
-    
+
 
 class LogSignal(QObject):
     """A small QObject to carry log messages to the GUI thread."""
