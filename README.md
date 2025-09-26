@@ -41,8 +41,9 @@ monitor.add_note("wave_1", "re-writen")
 monitor.remove_wfm("wave_10")
 ```
 
-## Thanks
+## Acknowledge
 
 This project is derived from [WaveViewer](https://github.com/kahojyun/wave-viewer).
 
-The icon is downloaded from https://www.freepik.com/icons/oscilloscope and made by piksart.
+The application icon was generated using OpenAI's DALL·E model and is released into the public domain (CC0).
+
