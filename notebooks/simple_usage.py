@@ -22,6 +22,5 @@ monitor.add_wfm("wave_1", t, [i_waves[-1], q_waves[-1], i_waves[0]])  # Replaces
 monitor.add_note("wave_1", "re-writen")
 
 monitor.remove_wfm("wave_10")
-# monitor.echo()
 
 monitor.close()  # drain waveforms sening jobs before client Python process exit.

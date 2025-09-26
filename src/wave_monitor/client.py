@@ -13,7 +13,7 @@ from PySide6.QtNetwork import QLocalSocket
 from typing_extensions import deprecated
 
 from .constants import CHUNK_SIZE, HEAD_LENGTH, PIPE_NAME, SHARED_MEMORY_NAME
-from .proto import decode, encode
+from .proto import encode
 
 logger = logging.getLogger(__name__)
 
@@ -134,21 +134,6 @@ class WaveMonitor:
         """
         self._io.submit_write(msg)
 
-    def query(self, msg: dict, timeout_ms: int = 1000):
-        """Send a message and wait for a response (synchronous API).
-
-        This delegates to the background I/O worker so the main thread doesn't
-        block on large writes. Raises TimeoutError on no response.
-        """
-        fut = self._io.submit_query(msg, timeout_ms)
-        try:
-            reply = fut.result(timeout=timeout_ms / 1000 + 1)
-        except Exception as e:
-            # Surface TimeoutError or connection errors
-            raise e
-        self.logger.debug("query received: %r", reply)
-        return reply
-
     def disconnect(self) -> None:
         fut = self._io.submit_disconnect()
         ok = fut.result(timeout=1.0)
@@ -212,9 +197,6 @@ class WaveMonitor:
                 raise TimeoutError("Timeout waiting for server to start listening.")
             time.sleep(0.1)
 
-    def echo(self) -> bytes:
-        return self.query(dict(_type="are_you_there"))
-
 
 class _IOWorker(threading.Thread):
     """A background I/O worker that owns the QLocalSocket and performs I/O."""
@@ -231,12 +213,6 @@ class _IOWorker(threading.Thread):
     def submit_write(self, msg: dict) -> None:
         self._tasks.put(("write", {"msg": msg}))
 
-    def submit_query(self, msg: dict, timeout_ms: int) -> Future:
-        fut: Future = Future()
-        self._tasks.put(
-            ("query", {"msg": msg, "timeout_ms": timeout_ms, "future": fut})
-        )
-        return fut
 
     def submit_connect(self, timeout_ms: int) -> Future:
         fut: Future = Future()
@@ -267,10 +243,6 @@ class _IOWorker(threading.Thread):
             try:
                 if op == "write":
                     self._handle_write(payload["msg"])  # fire-and-forget
-                elif op == "query":
-                    self._handle_query(
-                        payload["msg"], payload["timeout_ms"], payload["future"]
-                    )
                 elif op == "connect":
                     self._handle_connect(payload["timeout_ms"], payload["future"])
                 elif op == "disconnect":
@@ -368,33 +340,3 @@ class _IOWorker(threading.Thread):
         payload = encode(msg)
         self._write_payload(payload)
 
-    def _handle_query(self, msg: dict, timeout_ms: int, fut: Future) -> None:
-        if not self._ensure_connected(timeout_ms=100):
-            warnings.warn("Not connected to server.")
-            if not fut.done():
-                fut.set_exception(ConnectionError("Not connected to server"))
-            return
-
-        self.logger.debug("query send: %r", msg)
-        payload = encode(msg)
-        self._write_payload(payload)
-
-        assert self._sock is not None
-        self._sock.waitForBytesWritten()
-        if self._sock.waitForReadyRead(timeout_ms):
-            data = self._sock.readAll().data()
-        else:
-            if not fut.done():
-                fut.set_exception(
-                    TimeoutError(f"No response from server {timeout_ms=} {msg=}")
-                )
-            return
-
-        try:
-            reply = decode(data)
-        except Exception as e:
-            if not fut.done():
-                fut.set_exception(e)
-            return
-        if not fut.done():
-            fut.set_result(reply)

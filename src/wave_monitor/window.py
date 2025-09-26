@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 
 from .__about__ import __version__
 from .constants import CHUNK_SIZE, HEAD_LENGTH, PIPE_NAME, SHARED_MEMORY_NAME
-from .proto import decode, encode
+from .proto import decode
 
 about_message = (
     f"<b>Wave Monitor</b> v{__version__}<br><br>"
@@ -134,8 +134,6 @@ class DataSource(QLocalServer):
             self.autoscale.emit()
         elif msg["_type"] == "add_note":
             self.add_note.emit(msg["name"], msg["note"])
-        elif msg["_type"] == "are_you_there":
-            self.client_connection.write(encode("yes"))
         else:
             self.logger.exception(f"Unknown message type: {msg['_type']}")
 
