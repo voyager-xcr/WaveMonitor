@@ -2,7 +2,7 @@
 name = "WaveMonitor"
 dynamic = ["version"]
 dependencies = [
-    "msgpack",
+    "msgpack>=0.4.0",
     "msgpack_numpy",
     "numpy",
     "pyqtgraph",

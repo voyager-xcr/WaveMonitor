@@ -1,10 +1,10 @@
 import logging
 
-import msgpack
-import msgpack_numpy
 import numpy as np
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
+
+from wave_monitor.proto import decode, encode
 
 logger = logging.getLogger(__name__)
 
@@ -37,13 +37,13 @@ def client():
     t = np.linspace(0, 1, 100_000_001)
     ys = [np.sin(2 * np.pi * f * t) for f in [1,2]]
     msg = dict(_type="add_wfm", name="wave", t=t, ys=ys)
-    msg = msgpack.packb(msg, default=msgpack_numpy.encode)
+    msg = encode(msg)
     f"{len(msg):,} bytes"
 
     write_msg(sock, msg)
-    write_msg(sock, msgpack.packb('abc', default=msgpack_numpy.encode))
+    write_msg(sock, encode('abc'))
     write_msg(sock, b"asdhc")  # Illegal msg.
-    write_msg(sock, msgpack.packb('abc', default=msgpack_numpy.encode))
+    write_msg(sock, encode('abc'))
 
     sock.disconnectFromServer()
 
@@ -103,7 +103,7 @@ class DataSource(QLocalServer):
                 continue  # Proceed to read the rest.
 
             try:
-                data = msgpack.unpackb(self.frame_buffer, object_hook=msgpack_numpy.decode)
+                data = decode(self.frame_buffer)
             except Exception:
                 data = None
                 self.logger.exception("Failed to parse msg: %r", self.frame_buffer)
